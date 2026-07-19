@@ -26,6 +26,8 @@ bit-identical numerical results.
 - `scripts/windows_edof_bootstrap.ps1`: installs uv-managed Python and CUDA
   dependencies entirely below the project directory.
 - `scripts/windows_edof_start.ps1`: starts checkpoint-resumable training.
+- `scripts/windows_edof_worker.ps1`: persistent scheduled-task worker used so
+  training survives SSH disconnection.
 - `tests/`: Poly1D, NAFNet, optics, and end-to-end smoke tests.
 
 ## Mac smoke test
@@ -53,7 +55,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows_edof_start
 The bootstrap script puts uv, its cache, managed Python, and `.venv-edof` under
 the repository directory. The full run writes checkpoints and logs to
 `workspace\edof_reproduction\windows_full_actual` and resumes from
-`checkpoints\latest.pt` when present.
+`checkpoints\latest.pt` when present. The start script registers the
+`EDOFFullTraining` Windows scheduled task, so closing SSH does not stop Python.
 
 Monitor the detached process with:
 
