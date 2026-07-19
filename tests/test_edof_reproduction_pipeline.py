@@ -14,7 +14,7 @@ from edof_reproduction.config import (
     TrainingConfig,
     load_config,
 )
-from edof_reproduction.optics import CachedRayWaveOptics, load_or_build_cache
+from edof_reproduction.optics import CachedRayWaveOptics, _call_doe_field, load_or_build_cache
 from edof_reproduction.runner import run_training
 
 
@@ -72,6 +72,31 @@ def test_analytic_optics_is_differentiable(tmp_path: Path) -> None:
     psfs[0, 0, 0, 0, 0].backward()
     assert optics.doe.a2.grad is not None
     assert torch.isfinite(optics.doe.a2.grad)
+
+
+def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:
+    class FakeLens:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        def doe_field(self, point, wvln=None, spp=None, upsample_factor=None):
+            self.kwargs = {
+                "point": point,
+                "wvln": wvln,
+                "spp": spp,
+                "upsample_factor": upsample_factor,
+            }
+            return torch.ones(8, 8, dtype=torch.complex128), [0.0, 0.0]
+
+    lens = FakeLens()
+    field, _ = _call_doe_field(
+        lens,
+        point=torch.tensor([0.0, 0.0, -300.0]),
+        wavelength=0.55,
+        coherent_rays=1_000_000,
+    )
+    assert field.shape == (8, 8)
+    assert lens.kwargs["upsample_factor"] == 1
 
 
 def test_three_epoch_run_writes_trace_checkpoint_and_artifacts(tmp_path: Path) -> None:

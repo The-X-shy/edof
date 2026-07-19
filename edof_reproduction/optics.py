@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import math
 from pathlib import Path
 from typing import Any
@@ -171,6 +172,31 @@ def _all_wavelengths(config: OpticsConfig) -> tuple[float, ...]:
     return tuple(value for channel in config.wavelengths_rgb_um for value in channel)
 
 
+def _call_doe_field(
+    lens: Any,
+    *,
+    point: Tensor,
+    wavelength: float,
+    coherent_rays: int,
+) -> tuple[Tensor, Any]:
+    """Call DeepLens while keeping its field grid at the configured DOE grid.
+
+    DeepLens 2.5 adds an automatic upsampling mode that targets roughly
+    4000x4000 samples.  The staged 8 GB run must explicitly select factor 1;
+    older DeepLens releases do not expose this keyword and already return the
+    configured DOE resolution.
+    """
+
+    kwargs: dict[str, Any] = {
+        "point": point,
+        "wvln": wavelength,
+        "spp": coherent_rays,
+    }
+    if "upsample_factor" in inspect.signature(lens.doe_field).parameters:
+        kwargs["upsample_factor"] = 1
+    return lens.doe_field(**kwargs)
+
+
 def _analytic_cache(config: OpticsConfig) -> dict[str, Any]:
     grid = config.simulation_grid
     axis = torch.linspace(-1.0, 1.0, grid, dtype=torch.float64)
@@ -238,11 +264,21 @@ def _deeplens_cache(config: OpticsConfig) -> dict[str, Any]:
                 for field_index, (field_x, field_y) in enumerate(fields_xy):
                     point = torch.tensor([field_x, field_y, depth])
                     for wavelength_index, wavelength in enumerate(wavelengths):
-                        wavefront, center = lens.doe_field(
-                            point=point, wvln=wavelength, spp=config.coherent_rays
+                        wavefront, center = _call_doe_field(
+                            lens,
+                            point=point,
+                            wavelength=wavelength,
+                            coherent_rays=config.coherent_rays,
                         )
+                        wavefront = wavefront.squeeze()
+                        expected_grid = (config.simulation_grid, config.simulation_grid)
+                        if tuple(wavefront.shape) != expected_grid:
+                            raise RuntimeError(
+                                f"DeepLens returned field shape {tuple(wavefront.shape)}; "
+                                f"expected {expected_grid}. Check DOE resolution and upsampling."
+                            )
                         fields[depth_index, field_index, wavelength_index].copy_(
-                            wavefront.squeeze().cpu().to(complex_dtype)
+                            wavefront.cpu().to(complex_dtype)
                         )
                         centers[depth_index, field_index, wavelength_index] = torch.as_tensor(center).cpu()
                         completed += 1
