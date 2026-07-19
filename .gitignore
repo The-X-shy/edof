@@ -1,0 +1,13 @@
+.venv/
+.venv-edof/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+datasets/
+tools/
+python/
+uv-cache/
+workspace/
+*.log
+*.zip

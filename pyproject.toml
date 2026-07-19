@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edof-lens-reproduction"
+version = "0.1.0"
+description = "Standalone reproduction of the public EDOF hybrid-lens training protocol."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10",
+  "pydantic>=2",
+  "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+plot = ["matplotlib>=3.8"]
+
+[tool.setuptools.packages.find]
+include = ["edof_reproduction*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

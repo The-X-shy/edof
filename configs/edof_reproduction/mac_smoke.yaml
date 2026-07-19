@@ -1,0 +1,48 @@
+optics:
+  backend: deeplens
+  cache_device: cpu
+  lens_file: configs/edof_reproduction/a489_poly1d_base.json
+  cache_file: wavefront_cache.pt
+  focus_depth_mm: -300.0
+  depths_mm: [-200.0, -300.0, -10000.0]
+  wavelengths_rgb_um:
+    - [0.62, 0.66, 0.70]
+    - [0.50, 0.53, 0.56]
+    - [0.45, 0.47, 0.49]
+  field_grid: 1
+  simulation_grid: 64
+  psf_size: 31
+  coherent_rays: 1000000
+  doe_size_mm: 3.0
+  doe_sensor_distance_mm: 2.9472
+  quantization_levels: 16
+  quantize_during_training: true
+  cache_complex_dtype: complex128
+network:
+  width: 4
+  middle_blk_num: 1
+  enc_blk_nums: [1, 1]
+  dec_blk_nums: [1, 1]
+dataset:
+  mode: synthetic
+  crop_size: 64
+  synthetic_images: 1
+  batch_size: 1
+  workers: 0
+training:
+  seed: 240608
+  device: cpu
+  joint_epochs: 3
+  finetune_epochs: 0
+  max_batches_per_epoch: 1
+  doe_lr: 0.1
+  network_lr: 0.0001
+  warmup_epochs: 1
+  accumulation_steps: 1
+  quality_weight: 0.3
+  gradient_clip: 1.0
+  checkpoint_every: 1
+output:
+  root: workspace/edof_reproduction
+  run_name: mac_smoke
+  workspace_id: default
