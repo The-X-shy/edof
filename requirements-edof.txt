@@ -1,4 +1,4 @@
-deeplens-core @ git+https://github.com/singer-yang/DeepLens.git@7df9613ca06be4093d094ad3095bd8712641a77d
+deeplens-core @ https://codeload.github.com/singer-yang/DeepLens/zip/7df9613ca06be4093d094ad3095bd8712641a77d
 matplotlib>=3.8
 numpy>=1.26
 Pillow>=10
