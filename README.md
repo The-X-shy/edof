@@ -9,6 +9,10 @@ integration, Poly1D DOE, 16-level DOE quantization, cached ray-to-wave fields,
 NAFNet reconstruction, local trace/artifact recording, configurations, tests,
 and Windows/macOS environment scripts.
 
+DeepLens is installed from the public repository at commit
+`7df9613ca06be4093d094ad3095bd8712641a77d` so the optical API does not drift
+between machines.
+
 The paper does not release the complete Optolife prescription, trained DOE,
 sensor response, exact DOE-to-sensor spacing, or exact NAFNet training details.
 This project therefore reproduces the disclosed protocol with the public A489
