@@ -2,14 +2,14 @@ optics:
   backend: deeplens
   cache_device: cuda
   lens_file: configs/edof_reproduction/a489_poly1d_base.json
-  cache_file: wavefront_cache.pt
+  cache_file: wavefront_cache_10x10_256.pt
   focus_depth_mm: -300.0
   depths_mm: [-200.0, -300.0, -10000.0]
   wavelengths_rgb_um:
     - [0.62, 0.66, 0.70]
     - [0.50, 0.53, 0.56]
     - [0.45, 0.47, 0.49]
-  field_grid: 5
+  field_grid: 10
   simulation_grid: 256
   psf_size: 63
   coherent_rays: 1000000
@@ -48,7 +48,7 @@ evaluation:
 training:
   seed: 240608
   device: cuda
-  joint_epochs: 50
+  joint_epochs: 100
   finetune_epochs: 50
   max_batches_per_epoch: null
   doe_lr: 0.1
@@ -61,8 +61,8 @@ training:
   gradient_clip: 1.0
   sensor_noise_std: 0.01
   psf_pretrain_steps: 100
-  checkpoint_every: 1
+  checkpoint_every: 5
 output:
   root: workspace/edof_reproduction
-  run_name: windows_full
+  run_name: windows_high_accuracy
   workspace_id: default

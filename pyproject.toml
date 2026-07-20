@@ -9,6 +9,7 @@ description = "Standalone reproduction of the public EDOF hybrid-lens training p
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "lpips==0.1.4",
   "numpy>=1.26",
   "Pillow>=10",
   "pydantic>=2",

@@ -74,7 +74,10 @@ class CachedRayWaveOptics(nn.Module):
         self.depths = tuple(float(value) for value in cache["depths_mm"])
         self.fields_xy = tuple(tuple(value) for value in cache["fields_xy"])
         self.wavelengths = tuple(float(value) for value in cache["wavelengths_um"])
-        self.register_buffer("cached_fields", cache["fields"], persistent=False)
+        # Keep the multi-field complex cache in host memory. Moving the full
+        # 10x10 cache to an 8 GB GPU would consume several GB before FFT work
+        # begins; each selected wavelength is transferred on demand instead.
+        self.cached_fields = cache["fields"].cpu()
         self.register_buffer("centers", cache["centers"].float(), persistent=False)
         self.doe = Poly1DDOE(
             doe_radius=config.doe_size_mm / 2.0,
@@ -131,9 +134,11 @@ class CachedRayWaveOptics(nn.Module):
         wavelength = self.wavelengths[wavelength_index]
         fields = self.cached_fields[:, :, wavelength_index]
         depth_count, field_count = fields.shape[:2]
-        fields = fields.reshape(depth_count * field_count, *fields.shape[-2:]).to(self.device_for_compute)
-        target_complex = torch.complex64 if self.device_for_compute.type in {"cuda", "mps"} else fields.dtype
-        fields = fields.to(target_complex)
+        fields = fields.reshape(depth_count * field_count, *fields.shape[-2:])
+        target_complex = (
+            torch.complex64 if self.device_for_compute.type in {"cuda", "mps"} else fields.dtype
+        )
+        fields = fields.to(device=self.device_for_compute, dtype=target_complex)
         phase = self._phase(wavelength).to(fields.real.dtype)
         modulated = fields * torch.exp(1j * phase)
         height, width = modulated.shape[-2:]

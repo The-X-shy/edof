@@ -9,6 +9,7 @@ Set-Location $ProjectRoot
 $env:UV_INSTALL_DIR = Join-Path $ProjectRoot "tools"
 $env:UV_CACHE_DIR = Join-Path $ProjectRoot "uv-cache"
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $ProjectRoot "python"
+$env:TORCH_HOME = Join-Path $ProjectRoot "torch-cache"
 $env:Path = "$($env:UV_INSTALL_DIR);$($env:Path)"
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
@@ -37,6 +38,16 @@ if (-not (Test-Path $DatasetRoot)) {
         curl.exe -L --retry 5 --output $Archive "https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip"
     }
     Expand-Archive -Path $Archive -DestinationPath (Join-Path $ProjectRoot "datasets") -Force
+}
+
+$ValidationRoot = Join-Path $ProjectRoot "datasets\DIV2K_valid_HR"
+if (-not (Test-Path $ValidationRoot)) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "datasets") | Out-Null
+    $ValidationArchive = Join-Path $ProjectRoot "datasets\DIV2K_valid_HR.zip"
+    if (-not (Test-Path $ValidationArchive)) {
+        curl.exe -L --retry 5 --output $ValidationArchive "https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_valid_HR.zip"
+    }
+    Expand-Archive -Path $ValidationArchive -DestinationPath (Join-Path $ProjectRoot "datasets") -Force
 }
 
 Write-Output "WINDOWS_EDOF_READY"

@@ -1,6 +1,6 @@
 optics:
   backend: deeplens
-  cache_device: cpu
+  cache_device: cuda
   lens_file: configs/edof_reproduction/a489_poly1d_base.json
   cache_file: wavefront_cache.pt
   focus_depth_mm: -300.0
@@ -9,9 +9,9 @@ optics:
     - [0.62, 0.66, 0.70]
     - [0.50, 0.53, 0.56]
     - [0.45, 0.47, 0.49]
-  field_grid: 1
-  simulation_grid: 64
-  psf_size: 31
+  field_grid: 5
+  simulation_grid: 256
+  psf_size: 63
   coherent_rays: 1000000
   doe_size_mm: 3.0
   doe_sensor_distance_mm: 2.9472
@@ -19,37 +19,50 @@ optics:
   quantize_during_training: true
   cache_complex_dtype: complex128
 network:
-  width: 4
+  width: 16
   middle_blk_num: 1
-  enc_blk_nums: [1, 1]
-  dec_blk_nums: [1, 1]
+  enc_blk_nums: [1, 1, 1, 18]
+  dec_blk_nums: [1, 1, 1, 1]
 dataset:
-  mode: synthetic
-  crop_size: 64
-  synthetic_images: 1
+  mode: div2k
+  root: datasets/DIV2K_train_HR
+  crop_size: 128
   batch_size: 1
-  workers: 0
+  workers: 2
   random_crop: true
   random_resize_min_scale: 0.8
   color_jitter: 0.2
   horizontal_flip: true
 evaluation:
-  enabled: false
+  enabled: true
+  root: datasets/DIV2K_valid_HR
+  crop_size: 128
+  batch_size: 1
+  workers: 2
+  max_images: 100
+  every_n_epochs: 5
+  use_lpips: true
+  noise_std: 0.01
+  early_stopping_patience: 4
+  early_stopping_min_delta: 0.02
 training:
   seed: 240608
-  device: cpu
-  joint_epochs: 3
-  finetune_epochs: 0
-  max_batches_per_epoch: 1
+  device: cuda
+  joint_epochs: 50
+  finetune_epochs: 50
+  max_batches_per_epoch: null
   doe_lr: 0.1
   network_lr: 0.0001
-  warmup_epochs: 1
-  accumulation_steps: 1
+  finetune_lr: 0.0001
+  warmup_epochs: 3
+  accumulation_steps: 4
   pixel_loss_weight: 1.0
-  perceptual_weight: 0.0
+  perceptual_weight: 0.1
   gradient_clip: 1.0
+  sensor_noise_std: 0.01
+  psf_pretrain_steps: 100
   checkpoint_every: 1
 output:
   root: workspace/edof_reproduction
-  run_name: mac_smoke
+  run_name: windows_baseline_eval
   workspace_id: default

@@ -4,17 +4,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-Location $ProjectRoot
+$env:TORCH_HOME = Join-Path $ProjectRoot "torch-cache"
 $Python = Join-Path $ProjectRoot ".venv-edof\Scripts\python.exe"
-$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\windows_full_actual"
+$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\windows_high_accuracy"
 $Checkpoint = Join-Path $Output "checkpoints\latest.pt"
 $Stdout = Join-Path $Output "windows_train.stdout.log"
 $Stderr = Join-Path $Output "windows_train.stderr.log"
 $ExitStatus = Join-Path $Output "windows_train.exit.json"
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
+$Summary = Join-Path $Output "summary.json"
+if (Test-Path $Summary) {
+    $Completed = Get-Content $Summary -Raw | ConvertFrom-Json
+    if ($Completed.status -eq "completed") {
+        Write-Output "WINDOWS_EDOF_ALREADY_COMPLETED"
+        exit 0
+    }
+}
 
 $Arguments = @(
     "-u", "-m", "edof_reproduction",
-    "--config", "configs\edof_reproduction\windows_full.yaml",
+    "--config", "configs\edof_reproduction\windows_high_accuracy.yaml",
     "--output", $Output
 )
 if (Test-Path $Checkpoint) {

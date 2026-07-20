@@ -1,5 +1,6 @@
 deeplens-core @ https://github.com/singer-yang/DeepLens/archive/7df9613ca06be4093d094ad3095bd8712641a77d.zip
 matplotlib>=3.8
+lpips==0.1.4
 numpy>=1.26
 Pillow>=10
 pydantic>=2

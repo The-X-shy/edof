@@ -6,8 +6,8 @@ separate from the OptiResearch Agent project.
 
 The implementation contains only the EDOF optical runner, public DeepLens
 integration, Poly1D DOE, 16-level DOE quantization, cached ray-to-wave fields,
-NAFNet reconstruction, local trace/artifact recording, configurations, tests,
-and Windows/macOS environment scripts.
+NAFNet reconstruction, independent DIV2K validation, local trace/artifact
+recording, configurations, tests, and Windows/macOS environment scripts.
 
 DeepLens is installed from the public repository at commit
 `7df9613ca06be4093d094ad3095bd8712641a77d` so the optical API does not drift
@@ -53,20 +53,42 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows_edof_start
 ```
 
 The bootstrap script puts uv, its cache, managed Python, and `.venv-edof` under
-the repository directory. The full run writes checkpoints and logs to
-`workspace\edof_reproduction\windows_full_actual` and resumes from
+the repository directory. The recommended run writes checkpoints and logs to
+`workspace\edof_reproduction\windows_high_accuracy` and resumes from
 `checkpoints\latest.pt` when present. The start script registers the
 `EDOFFullTraining` Windows scheduled task, so closing SSH does not stop Python.
 
 Monitor the detached process with:
 
 ```powershell
-Get-Content .\workspace\edof_reproduction\windows_full_actual\windows_train.stdout.log -Tail 30 -Wait
+Get-Content .\workspace\edof_reproduction\windows_high_accuracy\windows_train.stdout.log -Tail 30 -Wait
 ```
 
-The Windows default uses a 256-point simulation grid and 5x5 field cache to fit
-an RTX 5060 8 GB card. The paper's 6000/12000-point wave grids require much more
-GPU memory and are not the default staged run.
+The recommended configuration uses the paper-disclosed 10x10 RGB PSF grid for
+joint training, a 256-point wave grid, one million coherent rays, 100 joint
+epochs, and up to 50 noisy network fine-tuning epochs. Validation runs on all
+100 DIV2K validation images every five epochs and records mean PSNR, SSIM, and
+LPIPS. The best checkpoint is selected by validation PSNR and fine-tuning stops
+after four validations without a meaningful improvement.
+
+Training uses epoch-varying random resized crops, color jitter, and horizontal
+flips. Its image loss follows the paper and the authors' public code: MSE plus
+0.1 times VGG16 feature loss. VGG and LPIPS weights are stored below
+`D:\edof\torch-cache` by the Windows scripts.
+
+The paper's 6000/12000-point wave grids require about 35 GB for one RGB PSF and
+cannot run on an RTX 5060 8 GB card. The 10x10/256 configuration has been tested
+with a real forward/backward pass and peaks below the available GPU memory.
+
+Evaluate an existing checkpoint without training:
+
+```powershell
+python -m edof_reproduction `
+  --config configs\edof_reproduction\windows_baseline_eval.yaml `
+  --resume workspace\edof_reproduction\windows_full_actual\checkpoints\latest.pt `
+  --evaluate-only `
+  --output workspace\edof_reproduction\windows_full_actual\baseline_validation
+```
 
 ## Tests
 

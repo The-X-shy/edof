@@ -14,7 +14,7 @@ if (-not (Test-Path $Worker)) {
     throw "Training worker is missing: $Worker"
 }
 
-$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\windows_full_actual"
+$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\windows_high_accuracy"
 $Checkpoint = Join-Path $Output "checkpoints\latest.pt"
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 
