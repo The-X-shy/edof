@@ -60,7 +60,7 @@ training:
   perceptual_weight: 0.1
   gradient_clip: 1.0
   sensor_noise_std: 0.01
-  psf_pretrain_steps: 100
+  psf_pretrain_steps: 0
   checkpoint_every: 5
 output:
   root: workspace/edof_reproduction
