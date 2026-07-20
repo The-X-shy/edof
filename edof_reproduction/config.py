@@ -90,6 +90,7 @@ class TrainingConfig:
     sensor_noise_std: float = 0.01
     psf_pretrain_steps: int = 0
     checkpoint_every: int = 1
+    log_every_batches: int = 100
     resume: str | None = None
 
 
@@ -168,6 +169,8 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("at least one training epoch is required")
     if training.accumulation_steps < 1 or dataset.batch_size < 1:
         raise ValueError("batch and accumulation sizes must be positive")
+    if training.checkpoint_every < 1 or training.log_every_batches < 1:
+        raise ValueError("checkpoint and batch-log intervals must be positive")
     if dataset.mode not in {"synthetic", "div2k"}:
         raise ValueError("dataset.mode must be synthetic or div2k")
     if not 0.0 < dataset.random_resize_min_scale <= 1.0:

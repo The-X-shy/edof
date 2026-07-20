@@ -50,7 +50,7 @@ def tiny_config(tmp_path: Path, epochs: int = 3) -> EDOFConfig:
             finetune_epochs=0,
             max_batches_per_epoch=1,
             warmup_epochs=1,
-            checkpoint_every=1,
+            checkpoint_every=5,
         ),
         output=OutputConfig(root=str(tmp_path), run_name="test", workspace_id="test"),
         source_config="test-config",
@@ -115,6 +115,7 @@ def test_three_epoch_run_writes_trace_checkpoint_and_artifacts(tmp_path: Path) -
     rows = (output / "training_log.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert [json.loads(row)["epoch"] for row in rows] == [1, 2, 3]
     assert (output / "checkpoints" / "latest.pt").exists()
+    assert not (output / "checkpoints" / "epoch_001.pt").exists()
     assert (output / "summary.json").exists()
     assert (output / "trace.sqlite").exists()
     assert (output / "artifact_manifest.json").exists()

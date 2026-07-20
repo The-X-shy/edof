@@ -415,6 +415,22 @@ def run_training(
             batch_metrics.append(metrics)
             global_step += 1
             last_clean, last_reconstructions, last_psfs = clean.detach(), [item.detach() for item in reconstructions], psfs.detach()
+            if (batch_index + 1) % config.training.log_every_batches == 0:
+                print(
+                    json.dumps(
+                        {
+                            "progress": {
+                                "epoch": epoch + 1,
+                                "stage": stage,
+                                "batch": batch_index + 1,
+                                "batches_total": len(loader),
+                                **metrics,
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
         if batch_metrics and len(batch_metrics) % config.training.accumulation_steps:
             torch.nn.utils.clip_grad_norm_(network.parameters(), config.training.gradient_clip)
             optimizer.step()
@@ -471,24 +487,19 @@ def run_training(
             "best_epoch": best_epoch,
             "evaluations_without_improvement": evaluations_without_improvement,
         }
-        checkpoint_path = output / "checkpoints" / f"epoch_{epoch + 1:03d}.pt"
+        latest_path = output / "checkpoints" / "latest.pt"
+        payload = _checkpoint_payload(
+            epoch, global_step, stage, optics, network, optimizer, scheduler, config, training_state
+        )
+        torch.save(payload, latest_path)
+        outputs = [log_path, latest_path]
         if (epoch + 1) % config.training.checkpoint_every == 0 or epoch + 1 == total_epochs:
+            checkpoint_path = output / "checkpoints" / f"epoch_{epoch + 1:03d}.pt"
             torch.save(
-                _checkpoint_payload(
-                    epoch, global_step, stage, optics, network, optimizer, scheduler, config, training_state
-                ),
+                payload,
                 checkpoint_path,
             )
-            latest_path = output / "checkpoints" / "latest.pt"
-            torch.save(
-                _checkpoint_payload(
-                    epoch, global_step, stage, optics, network, optimizer, scheduler, config, training_state
-                ),
-                latest_path,
-            )
-            outputs = [log_path, checkpoint_path, latest_path]
-        else:
-            outputs = [log_path]
+            outputs.append(checkpoint_path)
         if validation_result is not None and best_epoch == epoch + 1:
             best_path = output / "checkpoints" / "best.pt"
             torch.save(

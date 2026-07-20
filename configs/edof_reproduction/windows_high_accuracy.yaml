@@ -62,6 +62,7 @@ training:
   sensor_noise_std: 0.01
   psf_pretrain_steps: 0
   checkpoint_every: 5
+  log_every_batches: 50
 output:
   root: workspace/edof_reproduction
   run_name: windows_high_accuracy
