@@ -1,12 +1,14 @@
 param(
-    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+    [string]$Config = "configs\edof_reproduction\windows_optimized.yaml",
+    [string]$OutputName = "windows_optimized"
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location $ProjectRoot
 $env:TORCH_HOME = Join-Path $ProjectRoot "torch-cache"
 $Python = Join-Path $ProjectRoot ".venv-edof\Scripts\python.exe"
-$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\windows_high_accuracy"
+$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\$OutputName"
 $Checkpoint = Join-Path $Output "checkpoints\latest.pt"
 $Stdout = Join-Path $Output "windows_train.stdout.log"
 $Stderr = Join-Path $Output "windows_train.stderr.log"
@@ -23,7 +25,7 @@ if (Test-Path $Summary) {
 
 $Arguments = @(
     "-u", "-m", "edof_reproduction",
-    "--config", "configs\edof_reproduction\windows_high_accuracy.yaml",
+    "--config", $Config,
     "--output", $Output
 )
 if (Test-Path $Checkpoint) {

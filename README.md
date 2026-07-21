@@ -14,7 +14,7 @@ DeepLens is installed from the public repository at commit
 between machines.
 
 The paper does not release the complete Optolife prescription, trained DOE,
-sensor response, exact DOE-to-sensor spacing, or exact NAFNet training details.
+sensor response, or exact NAFNet training details.
 This project therefore reproduces the disclosed protocol with the public A489
 DeepLens base lens and records that boundary in every run; it does not claim
 bit-identical numerical results.
@@ -37,8 +37,8 @@ uv venv .venv-edof --python 3.12
 uv pip install --python .venv-edof/bin/python torch torchvision
 uv pip install --python .venv-edof/bin/python -r requirements-edof.txt
 .venv-edof/bin/python -m edof_reproduction \
-  --config configs/edof_reproduction/mac_smoke.yaml \
-  --output workspace/edof_reproduction/mac_smoke
+  --config configs/edof_reproduction/mac_optimized_smoke.yaml \
+  --output workspace/edof_reproduction/mac_optimized_smoke
 ```
 
 The smoke configuration runs three joint epochs on a small synthetic dataset.
@@ -54,31 +54,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows_edof_start
 
 The bootstrap script puts uv, its cache, managed Python, and `.venv-edof` under
 the repository directory. The recommended run writes checkpoints and logs to
-`workspace\edof_reproduction\windows_high_accuracy` and resumes from
+`workspace\edof_reproduction\windows_optimized` and resumes from
 `checkpoints\latest.pt` when present. The start script registers the
-`EDOFFullTraining` Windows scheduled task, so closing SSH does not stop Python.
+`EDOFOptimizedTraining` Windows scheduled task, so closing SSH does not stop Python.
+
+Verify the real CUDA forward/backward path before starting the detached run:
+
+```powershell
+.\.venv-edof\Scripts\python.exe -m edof_reproduction `
+  --config configs\edof_reproduction\windows_optimized_memory.yaml `
+  --memory-smoke `
+  --output workspace\edof_reproduction\windows_optimized_memory
+```
 
 Monitor the detached process with:
 
 ```powershell
-Get-Content .\workspace\edof_reproduction\windows_high_accuracy\windows_train.stdout.log -Tail 30 -Wait
+Get-Content .\workspace\edof_reproduction\windows_optimized\windows_train.stdout.log -Tail 30 -Wait
 ```
 
-The recommended configuration uses the paper-disclosed 10x10 RGB PSF grid for
-joint training, a 256-point wave grid, one million coherent rays, 100 joint
-epochs, and up to 50 noisy network fine-tuning epochs. Validation runs on all
-100 DIV2K validation images every five epochs and records mean PSNR, SSIM, and
-LPIPS. The best checkpoint is selected by validation PSNR and fine-tuning stops
-after four validations without a meaningful improvement.
+The optimized configuration uses the paper-disclosed 5x5 EDoF PSF grid for
+joint training, a 512-point double-precision wave grid, one million coherent
+rays, 50 joint epochs, and up to 50 noisy network fine-tuning epochs. The fixed
+optics stage interpolates the map to 40x40 as disclosed in the supplement.
+Validation runs on all 100 DIV2K validation images every five epochs and records
+mean PSNR, SSIM, and LPIPS. The best checkpoint is selected by validation PSNR
+and fine-tuning stops after four validations without a meaningful improvement.
 
 Training uses epoch-varying random resized crops, color jitter, and horizontal
-flips. Its image loss follows the paper and the authors' public code: MSE plus
-0.1 times VGG16 feature loss. VGG and LPIPS weights are stored below
+flips. Its EDoF loss follows Equation 1 of the supplement: cross-depth RMSE plus
+0.3 times reconstruction RMSE. LPIPS weights are stored below
 `D:\edof\torch-cache` by the Windows scripts.
 
-The paper's 6000/12000-point wave grids require about 35 GB for one RGB PSF and
-cannot run on an RTX 5060 8 GB card. The 10x10/256 configuration has been tested
-with a real forward/backward pass and peaks below the available GPU memory.
+The paper's 6000-point wave grid cannot run on an RTX 5060 8 GB card. The
+5x5/512 configuration keeps cached fields in host memory and computes one local
+field patch per training sample so the disclosed model can run on this GPU.
 
 Evaluate an existing checkpoint without training:
 

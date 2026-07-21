@@ -1,6 +1,8 @@
 param(
     [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [string]$TaskName = "EDOFFullTraining"
+    [string]$TaskName = "EDOFOptimizedTraining",
+    [string]$Config = "configs\edof_reproduction\windows_optimized.yaml",
+    [string]$OutputName = "windows_optimized"
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,12 +16,12 @@ if (-not (Test-Path $Worker)) {
     throw "Training worker is missing: $Worker"
 }
 
-$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\windows_high_accuracy"
+$Output = Join-Path $ProjectRoot "workspace\edof_reproduction\$OutputName"
 $Checkpoint = Join-Path $Output "checkpoints\latest.pt"
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 
 $PowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$ActionArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Worker`" -ProjectRoot `"$ProjectRoot`""
+$ActionArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Worker`" -ProjectRoot `"$ProjectRoot`" -Config `"$Config`" -OutputName `"$OutputName`""
 $Action = New-ScheduledTaskAction -Execute $PowerShell -Argument $ActionArguments -WorkingDirectory $ProjectRoot
 $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
 $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -42,5 +44,6 @@ $TaskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
     output = $Output
     stdout = (Join-Path $Output "windows_train.stdout.log")
     stderr = (Join-Path $Output "windows_train.stderr.log")
+    config = $Config
     resumed = (Test-Path $Checkpoint)
 } | ConvertTo-Json -Compress | Write-Output

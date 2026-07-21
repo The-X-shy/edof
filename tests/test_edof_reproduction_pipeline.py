@@ -20,9 +20,19 @@ from edof_reproduction.config import (
     load_config,
 )
 from edof_reproduction.dataset import DIV2KDataset
-from edof_reproduction.imaging import spatial_convolution
-from edof_reproduction.optics import CachedRayWaveOptics, _call_doe_field, load_or_build_cache
-from edof_reproduction.runner import _loss_from_psfs, run_memory_smoke, run_training
+from edof_reproduction.imaging import interpolate_psf_grid, spatial_convolution, wavelength_choice
+from edof_reproduction.optics import (
+    CachedRayWaveOptics,
+    _call_doe_field,
+    _field_coordinates,
+    load_or_build_cache,
+)
+from edof_reproduction.runner import (
+    _loss_from_psfs,
+    _psf_pretrain_loss,
+    run_memory_smoke,
+    run_training,
+)
 
 
 def tiny_config(tmp_path: Path, epochs: int = 3) -> EDOFConfig:
@@ -66,6 +76,19 @@ def test_mac_config_encodes_three_epoch_smoke() -> None:
     assert sum(len(group) for group in config.optics.wavelengths_rgb_um) == 9
 
 
+def test_optimized_config_matches_disclosed_edof_schedule() -> None:
+    config = load_config("configs/edof_reproduction/windows_optimized.yaml")
+    assert (config.training.joint_epochs, config.training.finetune_epochs) == (50, 50)
+    assert config.optics.field_grid == 5
+    assert config.optics.finetune_field_grid == 40
+    assert config.optics.propagation_precision == "float64"
+    assert not config.optics.quantize_during_training
+    assert config.training.pixel_loss_type == "rmse"
+    assert config.training.pixel_loss_weight == 0.3
+    assert config.training.cross_depth_loss_weight == 1.0
+    assert config.training.local_field_patches
+
+
 def test_analytic_optics_is_differentiable(tmp_path: Path) -> None:
     config = tiny_config(tmp_path)
     output = tmp_path / "cache"
@@ -79,6 +102,27 @@ def test_analytic_optics_is_differentiable(tmp_path: Path) -> None:
     psfs[0, 0, 0, 0, 0].backward()
     assert optics.doe.a2.grad is not None
     assert torch.isfinite(optics.doe.a2.grad)
+
+
+def test_square_doe_uses_corner_radius_and_pixel_centres(tmp_path: Path) -> None:
+    config = tiny_config(tmp_path)
+    output = tmp_path / "normalization"
+    output.mkdir()
+    cache, _ = load_or_build_cache(config.optics, output)
+    optics = CachedRayWaveOptics(config.optics, cache, torch.device("cpu"))
+    assert torch.allclose(
+        optics.doe.doe_radius,
+        torch.tensor(3.0 / np.sqrt(2.0), dtype=optics.doe.doe_radius.dtype),
+    )
+    assert torch.allclose(optics.grid_x[0, 0], torch.tensor(-1.40625, dtype=optics.grid_x.dtype))
+    assert torch.allclose(optics.grid_x[0, -1], torch.tensor(1.40625, dtype=optics.grid_x.dtype))
+
+
+def test_field_grid_matches_deeplens_patch_centres() -> None:
+    fields = _field_coordinates(5)
+    assert fields[0] == (-0.875, 0.875)
+    assert fields[4] == (0.875, 0.875)
+    assert fields[-1] == (0.875, -0.875)
 
 
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:
@@ -167,13 +211,36 @@ def test_spatial_convolution_matches_full_image_reference() -> None:
     psfs = psfs / psfs.sum(dim=(-2, -1), keepdim=True)
     actual = spatial_convolution(image, psfs)
     expected = torch.zeros_like(image)
+    padded = F.pad(image, (2, 2, 2, 2), mode="reflect")
     for index in range(4):
         row, column = divmod(index, 2)
-        top, bottom = round(row * 17 / 2), round((row + 1) * 17 / 2)
-        left, right = round(column * 19 / 2), round((column + 1) * 19 / 2)
-        blurred = F.conv2d(image, psfs[index, :, None], padding=2, groups=3)
-        expected[..., top:bottom, left:right] = blurred[..., top:bottom, left:right]
+        top, bottom = (row * 17) // 2, ((row + 1) * 17) // 2
+        left, right = (column * 19) // 2, ((column + 1) * 19) // 2
+        patch = padded[..., top : bottom + 4, left : right + 4]
+        expected[..., top:bottom, left:right] = F.conv2d(
+            patch,
+            torch.flip(psfs[index], dims=(-2, -1))[:, None],
+            groups=3,
+        )
     assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_psf_map_interpolation_is_normalized() -> None:
+    psfs = torch.rand(3, 25, 3, 5, 5)
+    psfs = psfs / psfs.sum(dim=(-2, -1), keepdim=True)
+    result = interpolate_psf_grid(psfs, 10)
+    assert result.shape == (3, 100, 3, 5, 5)
+    assert torch.allclose(result.sum(dim=(-2, -1)), torch.ones(3, 100, 3), atol=1e-6)
+
+
+def test_training_wavelengths_are_independent_and_replayable() -> None:
+    choices = [wavelength_choice(step, averaged=False) for step in range(40)]
+    assert choices == [wavelength_choice(step, averaged=False) for step in range(40)]
+    assert len(set(choices)) > 3
+    assert all(
+        0 <= value[0][0] <= 2 and 3 <= value[1][0] <= 5 and 6 <= value[2][0] <= 8
+        for value in choices
+    )
 
 
 def test_paper_loss_uses_pixel_and_perceptual_terms() -> None:
@@ -201,6 +268,51 @@ def test_paper_loss_uses_pixel_and_perceptual_terms() -> None:
     assert torch.allclose(loss, torch.tensor(metrics["pixel_mse"] * 1.2), atol=1e-6)
 
 
+def test_edof_loss_uses_rmse_quality_and_cross_depth_similarity() -> None:
+    clean = torch.zeros(1, 3, 9, 9)
+    clean[..., 4, 4] = 1.0
+    psfs = torch.zeros(3, 1, 3, 3, 3)
+    psfs[0, ..., 1, 1] = 1.0
+    psfs[1, ..., 1, 2] = 1.0
+    psfs[2, ..., 2, 1] = 1.0
+    network = torch.nn.Identity()
+    reconstructions = [spatial_convolution(clean, psfs[index]) for index in range(3)]
+    quality = torch.stack(
+        [torch.sqrt(F.mse_loss(reconstruction, clean) + 1e-12) for reconstruction in reconstructions]
+    ).mean()
+    pairs = torch.stack(
+        [
+            torch.sqrt(F.mse_loss(reconstructions[left], reconstructions[right]) + 1e-12)
+            for left, right in ((0, 1), (0, 2), (1, 2))
+        ]
+    ).mean()
+    loss, metrics, _ = _loss_from_psfs(
+        clean,
+        psfs,
+        network,
+        pixel_loss_weight=0.3,
+        perceptual_weight=0.0,
+        perceptual_loss=None,
+        noise_std=0.0,
+        pixel_loss_type="rmse",
+        cross_depth_loss_weight=1.0,
+    )
+    assert torch.allclose(loss, 0.3 * quality + pairs, atol=1e-6)
+    assert np.isclose(metrics["quality_loss"], float(quality), atol=1e-6)
+    assert np.isclose(metrics["cross_depth_rmse"], float(pairs), atol=1e-6)
+
+
+def test_psf_pretraining_combines_size_and_depth_similarity() -> None:
+    psfs = torch.rand(3, 1, 3, 5, 5)
+    psfs = psfs / psfs.sum(dim=(-2, -1), keepdim=True)
+    loss, metrics = _psf_pretrain_loss(psfs, size_weight=0.2, similarity_weight=1.0)
+    assert torch.allclose(
+        loss,
+        torch.tensor(0.2 * metrics["size"] + metrics["similarity"]),
+        atol=1e-6,
+    )
+
+
 def test_validation_averages_all_samples_and_saves_best_checkpoint(tmp_path: Path) -> None:
     config = replace(
         tiny_config(tmp_path, epochs=2),
@@ -224,6 +336,27 @@ def test_validation_averages_all_samples_and_saves_best_checkpoint(tmp_path: Pat
     assert all(item["samples"] == 1 for item in result["final_depth_metrics"])
     assert (output / "checkpoints" / "best.pt").exists()
     assert len((output / "validation_log.jsonl").read_text().strip().splitlines()) == 2
+
+
+def test_local_field_fixed_optics_finetune_runs(tmp_path: Path) -> None:
+    base = tiny_config(tmp_path, epochs=1)
+    config = replace(
+        base,
+        optics=replace(base.optics, finetune_field_grid=2),
+        training=replace(
+            base.training,
+            joint_epochs=1,
+            finetune_epochs=1,
+            local_field_patches=True,
+            pixel_loss_type="rmse",
+            pixel_loss_weight=0.3,
+            cross_depth_loss_weight=1.0,
+        ),
+    )
+    result = run_training(config, output_override=tmp_path / "finetune")
+    assert result["epochs_completed"] == 2
+    assert result["joint_epochs"] == 1
+    assert result["finetune_epochs"] == 1
 
 
 def test_memory_smoke_runs_real_backward_and_reports_cache(tmp_path: Path) -> None:

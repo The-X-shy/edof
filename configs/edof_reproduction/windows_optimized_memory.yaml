@@ -1,0 +1,60 @@
+optics:
+  backend: deeplens
+  cache_device: cuda
+  lens_file: configs/edof_reproduction/a489_poly1d_base.json
+  cache_file: wavefront_cache_1x1_512_v2.pt
+  focus_depth_mm: -300.0
+  depths_mm: [-200.0, -300.0, -10000.0]
+  wavelengths_rgb_um:
+    - [0.62, 0.66, 0.70]
+    - [0.50, 0.53, 0.56]
+    - [0.45, 0.47, 0.49]
+  field_grid: 1
+  simulation_grid: 512
+  psf_size: 63
+  coherent_rays: 1000000
+  doe_size_mm: 3.0
+  f_number: 2.2
+  sensor_resolution: [1000, 1000]
+  doe_normalization_radius_mm: 2.1213203435596424
+  quantization_levels: 16
+  quantize_during_training: false
+  cache_complex_dtype: complex128
+  propagation_precision: float64
+  propagation_batch_size: 3
+network:
+  width: 32
+  middle_blk_num: 1
+  enc_blk_nums: [1, 1, 1, 28]
+  dec_blk_nums: [1, 1, 1, 1]
+dataset:
+  mode: div2k
+  root: datasets/DIV2K_train_HR
+  crop_size: 128
+  batch_size: 1
+  workers: 0
+evaluation:
+  enabled: false
+training:
+  seed: 240608
+  device: cuda
+  joint_epochs: 1
+  finetune_epochs: 0
+  max_batches_per_epoch: 1
+  doe_lr: 0.1
+  network_lr: 0.0001
+  warmup_epochs: 1
+  accumulation_steps: 1
+  pixel_loss_weight: 0.3
+  perceptual_weight: 0.0
+  pixel_loss_type: rmse
+  cross_depth_loss_weight: 1.0
+  depth_loss_weights: [1.0, 1.0, 1.0]
+  local_field_patches: true
+  gradient_clip: 1.0
+  sensor_noise_std: 0.01
+  checkpoint_every: 1
+output:
+  root: workspace/edof_reproduction
+  run_name: windows_optimized_memory
+  workspace_id: default

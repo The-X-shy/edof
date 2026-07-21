@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
 import inspect
 import math
 from pathlib import Path
@@ -11,9 +12,21 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .config import OpticsConfig
 from .poly1d import Poly1DDOE
+
+
+_CACHE_VERSION = 2
+
+
+def _sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def fused_silica_index(wavelength_um: float | Tensor) -> Tensor:
@@ -74,27 +87,40 @@ class CachedRayWaveOptics(nn.Module):
         self.depths = tuple(float(value) for value in cache["depths_mm"])
         self.fields_xy = tuple(tuple(value) for value in cache["fields_xy"])
         self.wavelengths = tuple(float(value) for value in cache["wavelengths_um"])
+        self.sensor_resolution = tuple(
+            int(value) for value in cache.get("sensor_resolution", config.sensor_resolution)
+        )
+        self.propagation_distance_mm = float(
+            cache.get("doe_sensor_distance_mm", config.doe_sensor_distance_mm)
+        )
         # Keep the multi-field complex cache in host memory. Moving the full
         # 10x10 cache to an 8 GB GPU would consume several GB before FFT work
         # begins; each selected wavelength is transferred on demand instead.
         self.cached_fields = cache["fields"].cpu()
-        self.register_buffer("centers", cache["centers"].float(), persistent=False)
+        self.register_buffer("centers", cache["centers"], persistent=False)
+        propagation_dtype = (
+            torch.float64 if config.propagation_precision == "float64" else torch.float32
+        )
+        normalization_radius = config.doe_normalization_radius_mm
+        if normalization_radius is None:
+            # The paper DOE is a 3 mm square.  Historical Poly1D normalizes
+            # radius by the centre-to-corner distance, not the half width.
+            normalization_radius = config.doe_size_mm / math.sqrt(2.0)
         self.doe = Poly1DDOE(
-            doe_radius=config.doe_size_mm / 2.0,
-            coefficients=torch.zeros(6),
+            doe_radius=normalization_radius,
+            coefficients=None,
             design_wavelength_um=config.design_wavelength_um,
             design_refractive_index=config.design_refractive_index,
             quantization_levels=config.quantization_levels,
-            dtype=torch.float32,
+            dtype=propagation_dtype,
             device=device,
         )
-        axis = torch.linspace(
-            -config.doe_size_mm / 2.0,
-            config.doe_size_mm / 2.0,
-            config.simulation_grid,
-            dtype=torch.float32,
-            device=device,
-        )
+        # Sample square DOE pixels at their centres.  Including both physical
+        # endpoints makes the pitch size/(N-1), inconsistent with DeepLens.
+        pitch = config.doe_size_mm / config.simulation_grid
+        axis = (
+            torch.arange(config.simulation_grid, dtype=propagation_dtype, device=device) + 0.5
+        ) * pitch - config.doe_size_mm / 2.0
         yy, xx = torch.meshgrid(torch.flip(axis, dims=(0,)), axis, indexing="ij")
         self.register_buffer("grid_x", xx, persistent=False)
         self.register_buffer("grid_y", yy, persistent=False)
@@ -120,48 +146,104 @@ class CachedRayWaveOptics(nn.Module):
         size = self.config.psf_size
         offsets = torch.arange(
             -(size // 2), size // 2 + 1, device=intensity.device, dtype=intensity.dtype
-        ) / 1000.0
-        y_offset, x_offset = torch.meshgrid(offsets, offsets, indexing="ij")
+        )
+        sensor_height, sensor_width = self.sensor_resolution
+        # DeepLens pads the DOE field to twice its size and then resamples that
+        # full padded field to 2 * sensor_resolution.  Reproduce its integer
+        # sensor-pixel centre rounding without materialising that large image.
+        full_height, full_width = 2 * sensor_height, 2 * sensor_width
+        center_i = torch.round((2.0 - centers[:, 1]) * full_height / 4.0)
+        center_j = torch.round((2.0 + centers[:, 0]) * full_width / 4.0)
+        sample_i = center_i[:, None, None] + offsets[None, :, None]
+        sample_j = center_j[:, None, None] + offsets[None, None, :]
         grid = torch.empty((count, size, size, 2), device=intensity.device, dtype=intensity.dtype)
-        grid[..., 0] = centers[:, 0, None, None] / 2.0 + x_offset
-        grid[..., 1] = -centers[:, 1, None, None] / 2.0 + y_offset
+        grid[..., 0] = 2.0 * (sample_j + 0.5) / full_width - 1.0
+        grid[..., 1] = 2.0 * (sample_i + 0.5) / full_height - 1.0
         sampled = F.grid_sample(
             intensity[:, None], grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )[:, 0]
-        return sampled / sampled.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+        sampled = sampled / sampled.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+        # The paper keeps coherent tracing, phase modulation and ASM in double
+        # precision, then converts intensity PSFs to float for the network.
+        return sampled.float()
 
-    def _one_wavelength(self, wavelength_index: int) -> Tensor:
-        wavelength = self.wavelengths[wavelength_index]
-        fields = self.cached_fields[:, :, wavelength_index]
-        depth_count, field_count = fields.shape[:2]
-        fields = fields.reshape(depth_count * field_count, *fields.shape[-2:])
-        target_complex = (
-            torch.complex64 if self.device_for_compute.type in {"cuda", "mps"} else fields.dtype
-        )
-        fields = fields.to(device=self.device_for_compute, dtype=target_complex)
-        phase = self._phase(wavelength).to(fields.real.dtype)
+    def _propagate_chunk(
+        self,
+        fields: Tensor,
+        phase: Tensor,
+        centers: Tensor,
+        wavelength: float,
+    ) -> Tensor:
         modulated = fields * torch.exp(1j * phase)
         height, width = modulated.shape[-2:]
         padded = F.pad(modulated, (width // 2, width // 2, height // 2, height // 2))
         propagated = angular_spectrum(
             padded,
-            distance_mm=self.config.doe_sensor_distance_mm,
+            distance_mm=self.propagation_distance_mm,
             wavelength_um=wavelength,
             pixel_pitch_mm=self.config.doe_size_mm / self.config.simulation_grid,
             pad=False,
         )
-        intensity = propagated.abs().square().float()
-        centers = self.centers[:, :, wavelength_index].reshape(-1, 2).to(intensity.device)
-        return self._crop_psfs(intensity, centers).reshape(
+        return self._crop_psfs(propagated.abs().square(), centers)
+
+    def _one_wavelength(
+        self, wavelength_index: int, field_indices: tuple[int, ...] | None = None
+    ) -> Tensor:
+        wavelength = self.wavelengths[wavelength_index]
+        fields = self.cached_fields[:, :, wavelength_index]
+        centers = self.centers[:, :, wavelength_index]
+        if field_indices is not None:
+            fields = fields[:, list(field_indices)]
+            centers = centers[:, list(field_indices)]
+        depth_count, field_count = fields.shape[:2]
+        fields = fields.reshape(depth_count * field_count, *fields.shape[-2:])
+        target_complex = (
+            torch.complex128
+            if self.config.propagation_precision == "float64"
+            else torch.complex64
+        )
+        phase = self._phase(wavelength).to(
+            dtype=torch.float64 if target_complex == torch.complex128 else torch.float32
+        )
+        centers = centers.reshape(-1, 2)
+        chunk_size = self.config.propagation_batch_size or fields.shape[0]
+        psf_chunks = []
+        for start in range(0, fields.shape[0], chunk_size):
+            end = min(start + chunk_size, fields.shape[0])
+            field_chunk = fields[start:end].to(device=self.device_for_compute, dtype=target_complex)
+            center_chunk = centers[start:end].to(
+                device=self.device_for_compute, dtype=phase.dtype
+            )
+            if torch.is_grad_enabled() and phase.requires_grad:
+                psf_chunk = checkpoint(
+                    lambda values, phase_map, points: self._propagate_chunk(
+                        values, phase_map, points, wavelength
+                    ),
+                    field_chunk,
+                    phase,
+                    center_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                psf_chunk = self._propagate_chunk(field_chunk, phase, center_chunk, wavelength)
+            psf_chunks.append(psf_chunk)
+        return torch.cat(psf_chunks).reshape(
             depth_count, field_count, self.config.psf_size, self.config.psf_size
         )
 
-    def psfs(self, wavelength_choice: tuple[tuple[int, ...], ...]) -> Tensor:
+    def psfs(
+        self,
+        wavelength_choice: tuple[tuple[int, ...], ...],
+        *,
+        field_indices: tuple[int, ...] | None = None,
+    ) -> Tensor:
         """Return PSFs as ``[depth, field, RGB, kernel, kernel]``."""
 
         channels = []
         for indices in wavelength_choice:
-            stack = torch.stack([self._one_wavelength(index) for index in indices])
+            stack = torch.stack(
+                [self._one_wavelength(index, field_indices=field_indices) for index in indices]
+            )
             channels.append(stack.mean(dim=0))
         return torch.stack(channels, dim=2)
 
@@ -169,8 +251,10 @@ class CachedRayWaveOptics(nn.Module):
 def _field_coordinates(field_grid: int) -> list[tuple[float, float]]:
     if field_grid == 1:
         return [(0.0, 0.0)]
-    axis = torch.linspace(-1.0, 1.0, field_grid).tolist()
-    return [(float(x), float(y)) for y in axis for x in axis]
+    half_bin = 1.0 / (2.0 * (field_grid - 1))
+    x_axis = torch.linspace(-1.0 + half_bin, 1.0 - half_bin, field_grid).tolist()
+    y_axis = torch.linspace(1.0 - half_bin, -1.0 + half_bin, field_grid).tolist()
+    return [(float(x), float(y)) for y in y_axis for x in x_axis]
 
 
 def _all_wavelengths(config: OpticsConfig) -> tuple[float, ...]:
@@ -224,13 +308,18 @@ def _analytic_cache(config: OpticsConfig) -> dict[str, Any]:
                 centers[depth_index, field_index, wavelength_index] = torch.tensor((field_x, field_y))
     return {
         "format": "edof_reproduction.cached_fields",
-        "version": 1,
+        "version": _CACHE_VERSION,
         "backend": "analytic",
         "depths_mm": config.depths_mm,
         "fields_xy": fields_xy,
         "wavelengths_um": wavelengths,
         "fields": fields,
         "centers": centers,
+        "sensor_resolution": config.sensor_resolution,
+        "doe_sensor_distance_mm": config.doe_sensor_distance_mm,
+        "focus_depth_mm": config.focus_depth_mm,
+        "f_number": config.f_number,
+        "lens_file_sha256": _sha256(config.lens_file) if Path(config.lens_file).exists() else None,
     }
 
 
@@ -250,6 +339,8 @@ def _deeplens_cache(config: OpticsConfig) -> dict[str, Any]:
             raise RuntimeError("CUDA cache generation was requested but is unavailable")
         lens = HybridLens(filename=config.lens_file, device=cache_device)
         lens.refocus(config.focus_depth_mm)
+        if hasattr(lens.geolens, "set_fnum"):
+            lens.geolens.set_fnum(config.f_number)
         lens.doe.res = (config.simulation_grid, config.simulation_grid)
         lens.doe.ps = config.doe_size_mm / config.simulation_grid
         lens.doe.w = config.doe_size_mm
@@ -294,7 +385,7 @@ def _deeplens_cache(config: OpticsConfig) -> dict[str, Any]:
                         )
         return {
             "format": "edof_reproduction.cached_fields",
-            "version": 1,
+            "version": _CACHE_VERSION,
             "backend": "deeplens",
             "cache_device": cache_device,
             "deeplens_version": _deeplens_version(),
@@ -303,6 +394,11 @@ def _deeplens_cache(config: OpticsConfig) -> dict[str, Any]:
             "wavelengths_um": wavelengths,
             "fields": fields,
             "centers": centers,
+            "sensor_resolution": tuple(int(value) for value in lens.geolens.sensor_res),
+            "doe_sensor_distance_mm": float(lens.geolens.d_sensor - lens.doe.d),
+            "f_number": config.f_number,
+            "focus_depth_mm": config.focus_depth_mm,
+            "lens_file_sha256": _sha256(config.lens_file),
         }
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -319,12 +415,31 @@ def load_or_build_cache(config: OpticsConfig, output_dir: Path, *, force: bool =
         len(config.depths_mm), config.field_grid**2, 9,
         config.simulation_grid, config.simulation_grid,
     )
+    if cache.get("version") != _CACHE_VERSION:
+        raise ValueError("cached field format is outdated; rebuild the optical cache")
+    if cache.get("backend") != config.backend:
+        raise ValueError("cached optical backend does not match the configuration")
     if tuple(cache["fields"].shape) != expected:
         raise ValueError(f"cached field shape {tuple(cache['fields'].shape)} does not match {expected}")
     if tuple(float(value) for value in cache["depths_mm"]) != tuple(config.depths_mm):
         raise ValueError("cached depths do not match the configuration")
     if tuple(float(value) for value in cache["wavelengths_um"]) != _all_wavelengths(config):
         raise ValueError("cached wavelengths do not match the configuration")
+    expected_fields = torch.tensor(_field_coordinates(config.field_grid), dtype=torch.float64)
+    cached_fields = torch.tensor(cache["fields_xy"], dtype=torch.float64)
+    if not torch.allclose(cached_fields, expected_fields, atol=1e-6, rtol=0.0):
+        raise ValueError("cached field coordinates do not match the DeepLens PSF-map grid")
+    if float(cache.get("focus_depth_mm", float("nan"))) != float(config.focus_depth_mm):
+        raise ValueError("cached focus depth does not match the configuration")
+    if tuple(int(value) for value in cache.get("sensor_resolution", ())) != tuple(config.sensor_resolution):
+        raise ValueError("cached sensor resolution does not match the configuration")
+    if not math.isclose(float(cache.get("f_number", float("nan"))), config.f_number, abs_tol=1e-8):
+        raise ValueError("cached f-number does not match the configuration")
+    if cache.get("backend") == "deeplens":
+        if cache.get("lens_file_sha256") != _sha256(config.lens_file):
+            raise ValueError("cached lens prescription hash does not match the configuration")
+        if "doe_sensor_distance_mm" not in cache:
+            raise ValueError("cached propagation distance is missing; rebuild the optical cache")
     return cache, path
 
 
@@ -346,4 +461,6 @@ def cache_description(cache: dict[str, Any]) -> dict[str, Any]:
         "bytes": cache["fields"].nelement() * cache["fields"].element_size(),
         "depths_mm": list(cache["depths_mm"]),
         "wavelengths_um": list(cache["wavelengths_um"]),
+        "sensor_resolution": list(cache.get("sensor_resolution", ())),
+        "doe_sensor_distance_mm": cache.get("doe_sensor_distance_mm"),
     }

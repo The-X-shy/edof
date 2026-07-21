@@ -28,11 +28,17 @@ class OpticsConfig:
     coherent_rays: int = 1_000_000
     doe_size_mm: float = 3.0
     doe_sensor_distance_mm: float = 2.9472
+    f_number: float = 2.2
+    sensor_resolution: tuple[int, int] = (1000, 1000)
+    doe_normalization_radius_mm: float | None = None
+    finetune_field_grid: int | None = None
     design_wavelength_um: float = 0.55
     design_refractive_index: float = 1.4599
     quantization_levels: int = 16
     quantize_during_training: bool = True
     cache_complex_dtype: str = "complex128"
+    propagation_precision: str = "float32"
+    propagation_batch_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,8 @@ class EvaluationConfig:
     noise_std: float = 0.01
     early_stopping_patience: int = 4
     early_stopping_min_delta: float = 0.02
+    field_grid: int | None = None
+    local_field_patches: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,9 +94,15 @@ class TrainingConfig:
     accumulation_steps: int = 1
     pixel_loss_weight: float = 1.0
     perceptual_weight: float = 0.0
+    pixel_loss_type: str = "mse"
+    cross_depth_loss_weight: float = 0.0
+    depth_loss_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
+    local_field_patches: bool = False
     gradient_clip: float = 1.0
     sensor_noise_std: float = 0.01
     psf_pretrain_steps: int = 0
+    psf_pretrain_size_weight: float = 0.0
+    psf_pretrain_similarity_weight: float = 1.0
     checkpoint_every: int = 1
     log_every_batches: int = 100
     resume: str | None = None
@@ -161,6 +175,18 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("field_grid and simulation_grid are too small")
     if optics.psf_size < 3 or optics.psf_size % 2 == 0:
         raise ValueError("psf_size must be an odd integer of at least three")
+    if len(optics.sensor_resolution) != 2 or min(optics.sensor_resolution) < optics.psf_size:
+        raise ValueError("sensor_resolution must contain two values at least as large as psf_size")
+    if optics.doe_normalization_radius_mm is not None and optics.doe_normalization_radius_mm <= 0:
+        raise ValueError("doe_normalization_radius_mm must be positive when provided")
+    if optics.f_number <= 0:
+        raise ValueError("f_number must be positive")
+    if optics.finetune_field_grid is not None and optics.finetune_field_grid < optics.field_grid:
+        raise ValueError("finetune_field_grid must be at least field_grid")
+    if optics.propagation_precision not in {"float32", "float64"}:
+        raise ValueError("propagation_precision must be float32 or float64")
+    if optics.propagation_batch_size is not None and optics.propagation_batch_size < 1:
+        raise ValueError("propagation_batch_size must be positive when provided")
     if optics.coherent_rays < 1_000_000 and optics.backend == "deeplens":
         raise ValueError("DeepLens coherent ray tracing requires at least 1,000,000 rays")
     if training.joint_epochs < 0 or training.finetune_epochs < 0:
@@ -179,11 +205,25 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("dataset.color_jitter must be non-negative")
     if training.pixel_loss_weight <= 0.0 or training.perceptual_weight < 0.0:
         raise ValueError("training loss weights must be non-negative with a positive pixel weight")
+    if training.pixel_loss_type not in {"mse", "rmse"}:
+        raise ValueError("training.pixel_loss_type must be mse or rmse")
+    if training.cross_depth_loss_weight < 0.0:
+        raise ValueError("training.cross_depth_loss_weight must be non-negative")
+    if len(training.depth_loss_weights) != len(optics.depths_mm) or min(training.depth_loss_weights) <= 0:
+        raise ValueError("training.depth_loss_weights must provide one positive weight per depth")
+    if training.psf_pretrain_size_weight < 0.0 or training.psf_pretrain_similarity_weight < 0.0:
+        raise ValueError("PSF pretraining weights must be non-negative")
+    if training.psf_pretrain_steps > 0 and (
+        training.psf_pretrain_size_weight + training.psf_pretrain_similarity_weight <= 0.0
+    ):
+        raise ValueError("PSF pretraining needs at least one positive loss weight")
     if evaluation.enabled and dataset.mode == "div2k" and not evaluation.root:
         raise ValueError("evaluation.root is required for DIV2K validation")
     if evaluation.crop_size < 8 or evaluation.batch_size < 1 or evaluation.workers < 0:
         raise ValueError("evaluation crop, batch, and worker settings are invalid")
     if evaluation.every_n_epochs < 1 or evaluation.early_stopping_patience < 1:
         raise ValueError("evaluation interval and early-stopping patience must be positive")
+    if evaluation.field_grid is not None and evaluation.field_grid < optics.field_grid:
+        raise ValueError("evaluation.field_grid must be at least optics.field_grid")
     if evaluation.early_stopping_min_delta < 0.0 or evaluation.noise_std < 0.0:
         raise ValueError("evaluation deltas and noise must be non-negative")

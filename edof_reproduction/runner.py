@@ -28,6 +28,7 @@ from .provenance import (
 from .config import EDOFConfig
 from .dataset import build_loader, build_validation_loader
 from .evaluation import evaluate_reconstruction
+from .imaging import interpolate_psf_grid
 from .imaging import spatial_convolution as _spatial_convolution
 from .imaging import wavelength_choice as _wavelength_choice
 from .metrics import LPIPSMetric, VGG16PerceptualLoss, batch_psnr, batch_ssim
@@ -46,9 +47,10 @@ PAPER_SOURCES = {
 
 CLAIM_BOUNDARY = (
     "The publication does not release the exact Optolife prescription, trained DOE coefficients, "
-    "DOE-to-sensor spacing, sensor response, DIV2K crop schedule, noise model, or exact NAFNet config. "
+    "sensor response, DIV2K crop schedule, noise model, or exact NAFNet config. "
     "This run reproduces the disclosed training protocol with the public DeepLens A489 refractive "
-    "proxy and the historical public Poly1D DOE; it is not a numerical identity claim."
+    "proxy and the historical public Poly1D DOE. The coherent grid is reduced from the paper's "
+    "6000x6000 samples to fit an 8 GB GPU; this is not a numerical identity claim."
 )
 
 
@@ -102,6 +104,9 @@ def _loss_from_psfs(
     perceptual_weight: float,
     perceptual_loss: VGG16PerceptualLoss | None,
     noise_std: float,
+    pixel_loss_type: str = "mse",
+    cross_depth_loss_weight: float = 0.0,
+    depth_loss_weights: tuple[float, ...] | None = None,
 ) -> tuple[Tensor, dict[str, float], list[Tensor]]:
     reconstructions: list[Tensor] = []
     for depth_index in range(psfs.shape[0]):
@@ -110,18 +115,31 @@ def _loss_from_psfs(
             sensor = sensor + torch.randn_like(sensor) * noise_std
         reconstructions.append(network(sensor))
     similarity = _pairwise_rmse(reconstructions)
-    pixel_mse = torch.stack([F.mse_loss(item, clean) for item in reconstructions]).mean()
-    truth = torch.sqrt(pixel_mse + 1e-12)
+    depth_mse = torch.stack([F.mse_loss(item, clean) for item in reconstructions])
+    depth_rmse = torch.sqrt(depth_mse + 1e-12)
+    weights = depth_mse.new_ones(depth_mse.shape)
+    if depth_loss_weights is not None:
+        weights = torch.as_tensor(depth_loss_weights, device=depth_mse.device, dtype=depth_mse.dtype)
+    weights = weights / weights.sum().clamp_min(1e-12)
+    pixel_mse = depth_mse.mean()
+    truth = depth_rmse.mean()
+    quality = torch.sum(weights * (depth_rmse if pixel_loss_type == "rmse" else depth_mse))
     if perceptual_loss is not None and perceptual_weight > 0.0:
-        perceptual = torch.stack(
+        depth_perceptual = torch.stack(
             [perceptual_loss(item.clamp(0.0, 1.0), clean) for item in reconstructions]
-        ).mean()
+        )
+        perceptual = torch.sum(weights * depth_perceptual)
     else:
         perceptual = pixel_mse.new_zeros(())
-    loss = pixel_loss_weight * pixel_mse + perceptual_weight * perceptual
+    loss = (
+        pixel_loss_weight * quality
+        + perceptual_weight * perceptual
+        + cross_depth_loss_weight * similarity
+    )
     metrics = {
         "loss": float(loss.detach()),
         "pixel_mse": float(pixel_mse.detach()),
+        "quality_loss": float(quality.detach()),
         "perceptual_loss": float(perceptual.detach()),
         "cross_depth_rmse": float(similarity.detach()),
         "truth_rmse": float(truth.detach()),
@@ -140,8 +158,16 @@ def _loss_for_batch(
     perceptual_loss: VGG16PerceptualLoss | None,
     averaged_wavelengths: bool,
     noise_std: float,
+    pixel_loss_type: str = "mse",
+    cross_depth_loss_weight: float = 0.0,
+    depth_loss_weights: tuple[float, ...] | None = None,
+    field_index: int | None = None,
 ) -> tuple[Tensor, dict[str, float], list[Tensor], Tensor]:
-    psfs = optics.psfs(_wavelength_choice(step, averaged=averaged_wavelengths))
+    field_indices = (field_index,) if field_index is not None else None
+    psfs = optics.psfs(
+        _wavelength_choice(step, averaged=averaged_wavelengths),
+        field_indices=field_indices,
+    )
     loss, metrics, reconstructions = _loss_from_psfs(
         clean,
         psfs,
@@ -150,6 +176,9 @@ def _loss_for_batch(
         perceptual_weight=perceptual_weight,
         perceptual_loss=perceptual_loss,
         noise_std=noise_std,
+        pixel_loss_type=pixel_loss_type,
+        cross_depth_loss_weight=cross_depth_loss_weight,
+        depth_loss_weights=depth_loss_weights,
     )
     return loss, metrics, reconstructions, psfs
 
@@ -246,19 +275,73 @@ def _write_epoch_trace(
     return writer.write_trace(trace)
 
 
-def _pretrain_psf(optics: CachedRayWaveOptics, steps: int, learning_rate: float) -> list[float]:
+def _psf_rms_radius(psfs: Tensor) -> Tensor:
+    """Mean centroid-relative RMS radius of normalized PSFs."""
+
+    size = psfs.shape[-1]
+    axis = torch.linspace(-1.0, 1.0, size, device=psfs.device, dtype=psfs.dtype)
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    mass = psfs.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+    normalized = psfs / mass
+    center_x = (normalized * xx).sum(dim=(-2, -1), keepdim=True)
+    center_y = (normalized * yy).sum(dim=(-2, -1), keepdim=True)
+    variance = (
+        normalized * ((xx - center_x).square() + (yy - center_y).square())
+    ).sum(dim=(-2, -1))
+    return torch.sqrt(variance.clamp_min(1e-12)).mean()
+
+
+def _psf_pretrain_loss(
+    psfs: Tensor,
+    *,
+    size_weight: float,
+    similarity_weight: float,
+) -> tuple[Tensor, dict[str, float]]:
+    size_loss = _psf_rms_radius(psfs)
+    similarity_loss = _pairwise_rmse([psfs[index] for index in range(psfs.shape[0])])
+    loss = size_weight * size_loss + similarity_weight * similarity_loss
+    return loss, {
+        "loss": float(loss.detach()),
+        "size": float(size_loss.detach()),
+        "similarity": float(similarity_loss.detach()),
+    }
+
+
+def _pretrain_psf(
+    optics: CachedRayWaveOptics,
+    steps: int,
+    learning_rate: float,
+    *,
+    size_weight: float,
+    similarity_weight: float,
+) -> list[float]:
     if steps <= 0:
         return []
     optimizer = torch.optim.Adam(optics.doe.parameters(), lr=learning_rate)
     losses = []
+    report_every = max(steps // 10, 1)
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
-        psfs = optics.psfs(_wavelength_choice(step, averaged=False))
-        center = psfs[:, psfs.shape[1] // 2]
-        loss = _pairwise_rmse([center[index] for index in range(center.shape[0])])
+        field_index = step % optics.field_count
+        psfs = optics.psfs(
+            _wavelength_choice(step, averaged=False), field_indices=(field_index,)
+        )
+        loss, metrics = _psf_pretrain_loss(
+            psfs,
+            size_weight=size_weight,
+            similarity_weight=similarity_weight,
+        )
         loss.backward()
         optimizer.step()
         losses.append(float(loss.detach()))
+        if (step + 1) % report_every == 0 or step + 1 == steps:
+            print(
+                json.dumps(
+                    {"psf_pretrain": {"step": step + 1, "steps_total": steps, **metrics}},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
     return losses
 
 
@@ -317,7 +400,7 @@ def run_training(
         if epoch < config.training.warmup_epochs:
             return max((epoch + 1) / max(config.training.warmup_epochs, 1), 1e-3)
         progress = (epoch - config.training.warmup_epochs) / max(
-            total_epochs - config.training.warmup_epochs - 1, 1
+            total_epochs - config.training.warmup_epochs, 1
         )
         return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
@@ -349,7 +432,11 @@ def run_training(
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
 
     pretrain_losses = _pretrain_psf(
-        optics, config.training.psf_pretrain_steps if start_epoch == 0 else 0, config.training.doe_lr
+        optics,
+        config.training.psf_pretrain_steps if start_epoch == 0 else 0,
+        config.training.doe_lr,
+        size_weight=config.training.psf_pretrain_size_weight,
+        similarity_weight=config.training.psf_pretrain_similarity_weight,
     )
     trace_store = SQLiteStore(output / "trace.sqlite")
     trace_writer = MetaTraceWriter(trace_store)
@@ -373,7 +460,12 @@ def run_training(
                 optimizer = torch.optim.Adam(network.parameters(), lr=config.training.finetune_lr)
                 remaining = max(total_epochs - epoch, 1)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining)
-            fixed_finetune_psfs = optics.psfs(_wavelength_choice(global_step, averaged=True)).detach()
+            fixed_finetune_psfs = optics.psfs(
+                _wavelength_choice(global_step, averaged=True)
+            ).detach()
+            fixed_finetune_psfs = interpolate_psf_grid(
+                fixed_finetune_psfs, config.optics.finetune_field_grid
+            ).detach()
             evaluations_without_improvement = 0
         if hasattr(loader.dataset, "set_epoch"):
             loader.dataset.set_epoch(epoch)
@@ -385,6 +477,11 @@ def run_training(
                 break
             clean = clean.to(device)
             if fixed_finetune_psfs is None:
+                field_index = (
+                    global_step % optics.field_count
+                    if config.training.local_field_patches
+                    else None
+                )
                 loss, metrics, reconstructions, psfs = _loss_for_batch(
                     clean,
                     optics,
@@ -395,18 +492,29 @@ def run_training(
                     perceptual_loss=perceptual_loss,
                     averaged_wavelengths=False,
                     noise_std=0.0,
+                    pixel_loss_type=config.training.pixel_loss_type,
+                    cross_depth_loss_weight=config.training.cross_depth_loss_weight,
+                    depth_loss_weights=config.training.depth_loss_weights,
+                    field_index=field_index,
                 )
             else:
+                batch_psfs = fixed_finetune_psfs
+                if config.training.local_field_patches:
+                    field_index = global_step % fixed_finetune_psfs.shape[1]
+                    batch_psfs = fixed_finetune_psfs[:, field_index : field_index + 1]
                 loss, metrics, reconstructions = _loss_from_psfs(
                     clean,
-                    fixed_finetune_psfs,
+                    batch_psfs,
                     network,
                     pixel_loss_weight=config.training.pixel_loss_weight,
                     perceptual_weight=config.training.perceptual_weight,
                     perceptual_loss=perceptual_loss,
                     noise_std=config.training.sensor_noise_std,
+                    pixel_loss_type=config.training.pixel_loss_type,
+                    cross_depth_loss_weight=config.training.cross_depth_loss_weight,
+                    depth_loss_weights=config.training.depth_loss_weights,
                 )
-                psfs = fixed_finetune_psfs
+                psfs = batch_psfs
             (loss / config.training.accumulation_steps).backward()
             if (batch_index + 1) % config.training.accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(network.parameters(), config.training.gradient_clip)
@@ -466,8 +574,10 @@ def run_training(
                 depths_mm=config.optics.depths_mm,
                 noise_std=config.evaluation.noise_std,
                 use_lpips=config.evaluation.use_lpips,
-                seed=config.training.seed + epoch + 1,
+                seed=config.training.seed,
                 lpips_metric=lpips_metric,
+                field_grid=config.evaluation.field_grid,
+                local_field_patches=config.evaluation.local_field_patches,
             )
             validation_row = {"epoch": epoch + 1, "stage": stage, **validation_result}
             with validation_log_path.open("a", encoding="utf-8") as handle:
@@ -561,6 +671,8 @@ def run_training(
             use_lpips=config.evaluation.use_lpips,
             seed=config.training.seed,
             lpips_metric=lpips_metric,
+            field_grid=config.evaluation.field_grid,
+            local_field_patches=config.evaluation.local_field_patches,
         )
         depth_metrics = final_evaluation["depth_metrics"]
         final_psfs = final_sample["psfs"]
@@ -789,6 +901,8 @@ def run_checkpoint_evaluation(
         use_lpips=config.evaluation.use_lpips,
         seed=config.training.seed,
         lpips_metric=lpips_metric,
+        field_grid=config.evaluation.field_grid,
+        local_field_patches=config.evaluation.local_field_patches,
     )
 
     clean_path = output / "validation_clean.png"
@@ -873,6 +987,10 @@ def run_memory_smoke(
         perceptual_loss=perceptual_loss,
         averaged_wavelengths=False,
         noise_std=0.0,
+        pixel_loss_type=config.training.pixel_loss_type,
+        cross_depth_loss_weight=config.training.cross_depth_loss_weight,
+        depth_loss_weights=config.training.depth_loss_weights,
+        field_index=0 if config.training.local_field_patches else None,
     )
     loss.backward()
     result = {
