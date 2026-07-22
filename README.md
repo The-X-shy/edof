@@ -131,6 +131,33 @@ python -m edof_reproduction `
   --output workspace\edof_reproduction\windows_full_actual\baseline_validation
 ```
 
+## Recommended exact-PSF sequence
+
+The recommended sequence isolates the exact 40x40 PSF change before spending
+another full run:
+
+1. evaluate `windows_optimized/checkpoints/best.pt` on the existing exact PSF
+   cache without training;
+2. train 15 epochs with perceptual weights 0.02 and 0.05 from the same
+   checkpoint and seed;
+3. select a Pareto checkpoint with at most 0.1 dB PSNR loss and at least 0.02
+   1-LPIPS gain when that guard is achievable;
+4. train only the selected weight for 50 epochs;
+5. evaluate both the PSNR-best and 1-LPIPS-best full-run checkpoints.
+
+Start the resumable sequence as a Windows scheduled task:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\windows_edof_sequence_start.ps1
+```
+
+The task writes its current step to
+`workspace\edof_reproduction\windows_recommended_sequence\sequence_state.json`.
+The final comparison, selected checkpoint, and paper gaps are written to
+`windows_recommended_sequence\final_summary.json`. Existing completed steps are
+skipped and interrupted training resumes from `checkpoints\latest.pt`.
+
 ## Tests
 
 ```bash

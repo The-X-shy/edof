@@ -103,6 +103,34 @@ def test_practical_config_uses_exact_psfs_and_perceptual_finetune() -> None:
     assert config.training.cross_depth_loss_weight == 0.1
 
 
+def test_recommended_sequence_configs_share_exact_cache_and_initialization() -> None:
+    baseline = load_config("configs/edof_reproduction/windows_exact_baseline_eval.yaml")
+    assert baseline.optics.finetune_psf_mode == "exact"
+    assert baseline.optics.finetune_psf_cache_file.startswith(
+        "../windows_practical_finetune/"
+    )
+    expected = {
+        "windows_practical_p002_short.yaml": (15, 0.02),
+        "windows_practical_p005_short.yaml": (15, 0.05),
+        "windows_practical_p002_full.yaml": (50, 0.02),
+        "windows_practical_p005_full.yaml": (50, 0.05),
+    }
+    for name, (epochs, weight) in expected.items():
+        config = load_config(f"configs/edof_reproduction/{name}")
+        assert (config.training.joint_epochs, config.training.finetune_epochs) == (0, epochs)
+        assert config.training.perceptual_weight == weight
+        assert config.training.pixel_loss_weight == 1.0
+        assert config.training.cross_depth_loss_weight == 0.1
+        assert config.training.seed == 240608
+        assert config.training.initialize_from.endswith(
+            "windows_optimized/checkpoints/best.pt"
+        )
+        assert config.optics.cache_file.startswith("../windows_practical_finetune/")
+        assert config.optics.finetune_psf_cache_file.startswith(
+            "../windows_practical_finetune/"
+        )
+
+
 def test_resume_and_initialize_from_are_mutually_exclusive(tmp_path: Path) -> None:
     config = tiny_config(tmp_path, epochs=1)
     config = replace(
