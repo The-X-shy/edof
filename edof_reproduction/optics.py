@@ -580,6 +580,8 @@ def _fill_exact_deeplens_psfs(
         raise RuntimeError("DeepLens is required to compute the exact fixed PSF map") from exc
 
     previous_dtype = torch.get_default_dtype()
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     torch.set_default_dtype(torch.float64)
     try:
         cache_device = config.cache_device
@@ -595,6 +597,18 @@ def _fill_exact_deeplens_psfs(
         lens.doe.ps = config.doe_size_mm / config.simulation_grid
         lens.doe.w = config.doe_size_mm
         lens.doe.h = config.doe_size_mm
+        # DeepLens refocus estimates the sensor plane from sampled rays, so a
+        # second HybridLens can differ by a fraction of a micron.  The PSF-map
+        # pass must use the sensor plane recorded with the base optical cache.
+        pinned_sensor_distance = float(lens.doe.d) + optics.propagation_distance_mm
+        lens.geolens.d_sensor.copy_(
+            torch.as_tensor(
+                pinned_sensor_distance,
+                device=lens.geolens.d_sensor.device,
+                dtype=lens.geolens.d_sensor.dtype,
+            )
+        )
+        lens.geolens.post_computation()
         propagation_distance = float(lens.geolens.d_sensor - lens.doe.d)
         if not math.isclose(
             propagation_distance,
@@ -636,6 +650,20 @@ def _fill_exact_deeplens_psfs(
                                 config.psf_size, config.psf_size, dtype=torch.float32
                             )
                             for wavelength in wavelengths:
+                                # Make every expensive ray trace independent of
+                                # loop history, so an interrupted map resumes
+                                # with the same per-field Monte Carlo samples.
+                                seed_material = (
+                                    f"{field_index}:{depth_index}:{float(wavelength):.12g}:"
+                                    f"{config.coherent_rays}:{payload['signature']['lens_file_sha256']}"
+                                )
+                                ray_seed = int(
+                                    hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:16],
+                                    16,
+                                ) % (2**63 - 1)
+                                torch.manual_seed(ray_seed)
+                                if torch.cuda.is_available():
+                                    torch.cuda.manual_seed_all(ray_seed)
                                 wavefront, center = _call_doe_field(
                                     lens,
                                     point=point,
@@ -687,6 +715,9 @@ def _fill_exact_deeplens_psfs(
             raise
     finally:
         torch.set_default_dtype(previous_dtype)
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
 
 
 def load_or_build_fixed_psf_map(
