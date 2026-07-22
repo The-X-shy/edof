@@ -22,6 +22,7 @@ from .poly1d import Poly1DDOE
 
 _CACHE_VERSION = 2
 _FIXED_PSF_CACHE_VERSION = 1
+_LENS_SPACING_ABS_TOLERANCE_MM = 1e-5
 
 
 def _sha256(path: str | Path) -> str:
@@ -599,9 +600,13 @@ def _fill_exact_deeplens_psfs(
             propagation_distance,
             optics.propagation_distance_mm,
             rel_tol=0.0,
-            abs_tol=1e-8,
+            abs_tol=_LENS_SPACING_ABS_TOLERANCE_MM,
         ):
-            raise ValueError("exact PSF lens spacing does not match the training optical cache")
+            raise ValueError(
+                "exact PSF lens spacing does not match the training optical cache: "
+                f"live={propagation_distance:.12g} mm, "
+                f"cached={optics.propagation_distance_mm:.12g} mm"
+            )
 
         target_complex = (
             torch.complex128
