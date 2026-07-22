@@ -33,7 +33,12 @@ from .imaging import spatial_convolution as _spatial_convolution
 from .imaging import wavelength_choice as _wavelength_choice
 from .metrics import LPIPSMetric, VGG16PerceptualLoss, batch_psnr, batch_ssim
 from .nafnet import NAFNet
-from .optics import CachedRayWaveOptics, cache_description, load_or_build_cache
+from .optics import (
+    CachedRayWaveOptics,
+    cache_description,
+    load_or_build_cache,
+    load_or_build_fixed_psf_map,
+)
 
 
 PAPER_SOURCES = {
@@ -51,6 +56,12 @@ CLAIM_BOUNDARY = (
     "This run reproduces the disclosed training protocol with the public DeepLens A489 refractive "
     "proxy and the historical public Poly1D DOE. The coherent grid is reduced from the paper's "
     "6000x6000 samples to fit an 8 GB GPU; this is not a numerical identity claim."
+)
+
+PRACTICAL_FINETUNE_BOUNDARY = (
+    "The practical fine-tune uses a true 40x40 field-sampled PSF map and adds VGG16 perceptual "
+    "loss while reducing cross-depth similarity regularization. It is intended to improve usable "
+    "image quality on an 8 GB RTX 5060 and is not a strict reproduction of the paper loss."
 )
 
 
@@ -430,10 +441,20 @@ def run_training(
         torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
         if torch.cuda.is_available() and checkpoint.get("cuda_rng_state"):
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+    elif config.training.initialize_from:
+        checkpoint = torch.load(
+            config.training.initialize_from, map_location=device, weights_only=False
+        )
+        optics.doe.load_exported_state(checkpoint["doe"])
+        network.load_state_dict(checkpoint["network"])
 
     pretrain_losses = _pretrain_psf(
         optics,
-        config.training.psf_pretrain_steps if start_epoch == 0 else 0,
+        (
+            config.training.psf_pretrain_steps
+            if start_epoch == 0 and not config.training.initialize_from
+            else 0
+        ),
         config.training.doe_lr,
         size_weight=config.training.psf_pretrain_size_weight,
         similarity_weight=config.training.psf_pretrain_similarity_weight,
@@ -448,6 +469,7 @@ def run_training(
     last_psfs: Tensor | None = None
     epoch_history: list[dict[str, Any]] = []
     fixed_finetune_psfs: Tensor | None = None
+    fixed_finetune_psf_path: Path | None = None
     stopped_early = False
     epochs_completed = start_epoch
 
@@ -460,13 +482,19 @@ def run_training(
                 optimizer = torch.optim.Adam(network.parameters(), lr=config.training.finetune_lr)
                 remaining = max(total_epochs - epoch, 1)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining)
-            fixed_finetune_psfs = optics.psfs(
-                _wavelength_choice(global_step, averaged=True)
-            ).detach()
-            fixed_finetune_psfs = interpolate_psf_grid(
-                fixed_finetune_psfs, config.optics.finetune_field_grid
-            ).detach()
-            evaluations_without_improvement = 0
+            if config.optics.finetune_psf_mode == "exact":
+                fixed_finetune_psfs, fixed_finetune_psf_path = load_or_build_fixed_psf_map(
+                    config.optics, optics, output
+                )
+            else:
+                fixed_finetune_psfs = optics.psfs(
+                    _wavelength_choice(global_step, averaged=True)
+                ).detach()
+                fixed_finetune_psfs = interpolate_psf_grid(
+                    fixed_finetune_psfs, config.optics.finetune_field_grid
+                ).detach().cpu()
+            if resumed_stage != "finetune":
+                evaluations_without_improvement = 0
         if hasattr(loader.dataset, "set_epoch"):
             loader.dataset.set_epoch(epoch)
         network.train()
@@ -502,6 +530,7 @@ def run_training(
                 if config.training.local_field_patches:
                     field_index = global_step % fixed_finetune_psfs.shape[1]
                     batch_psfs = fixed_finetune_psfs[:, field_index : field_index + 1]
+                batch_psfs = batch_psfs.to(device, non_blocking=True)
                 loss, metrics, reconstructions = _loss_from_psfs(
                     clean,
                     batch_psfs,
@@ -578,6 +607,7 @@ def run_training(
                 lpips_metric=lpips_metric,
                 field_grid=config.evaluation.field_grid,
                 local_field_patches=config.evaluation.local_field_patches,
+                fixed_psfs=fixed_finetune_psfs if stage == "finetune" else None,
             )
             validation_row = {"epoch": epoch + 1, "stage": stage, **validation_result}
             with validation_log_path.open("a", encoding="utf-8") as handle:
@@ -673,6 +703,7 @@ def run_training(
             lpips_metric=lpips_metric,
             field_grid=config.evaluation.field_grid,
             local_field_patches=config.evaluation.local_field_patches,
+            fixed_psfs=fixed_finetune_psfs,
         )
         depth_metrics = final_evaluation["depth_metrics"]
         final_psfs = final_sample["psfs"]
@@ -737,6 +768,11 @@ def run_training(
         "best_epoch": best_epoch,
         "best_validation_psnr": best_validation_psnr if best_epoch is not None else None,
         "selected_checkpoint": str(selected_checkpoint),
+        "initialized_from": config.training.initialize_from,
+        "finetune_psf_mode": config.optics.finetune_psf_mode,
+        "fixed_finetune_psf_cache": (
+            str(fixed_finetune_psf_path) if fixed_finetune_psf_path is not None else None
+        ),
         "pretrain_steps": len(pretrain_losses),
         "pretrain_first_loss": pretrain_losses[0] if pretrain_losses else None,
         "pretrain_last_loss": pretrain_losses[-1] if pretrain_losses else None,
@@ -745,6 +781,11 @@ def run_training(
         "doe_coefficients": [float(value) for value in optics.doe.coefficients.detach().cpu()],
         "sources": PAPER_SOURCES,
         "claim_boundary": CLAIM_BOUNDARY,
+        "practical_finetune_boundary": (
+            PRACTICAL_FINETUNE_BOUNDARY
+            if config.training.perceptual_weight > 0.0
+            else None
+        ),
         "paper_table4_targets": [
             {"depth_mm": -200.0, "psnr": 27.5, "ssim": 0.821, "one_minus_lpips": 0.782},
             {"depth_mm": -300.0, "psnr": 28.9, "ssim": 0.869, "one_minus_lpips": 0.842},
@@ -813,6 +854,18 @@ def run_training(
         artifacts.append((validation_log_path, "validation_log", {}))
     if best_path.exists():
         artifacts.append((best_path, "best_checkpoint", {"best_epoch": best_epoch}))
+    if fixed_finetune_psf_path is not None:
+        fixed_psf_metadata = fixed_finetune_psf_path.with_suffix(
+            fixed_finetune_psf_path.suffix + ".metadata.json"
+        )
+        if fixed_psf_metadata.exists():
+            artifacts.append(
+                (
+                    fixed_psf_metadata,
+                    "fixed_psf_cache_metadata",
+                    {"field_grid": config.optics.finetune_field_grid},
+                )
+            )
     for path, artifact_type, metrics in artifacts:
         registered.append(
             artifact_store.register_file(
@@ -889,6 +942,12 @@ def run_checkpoint_evaluation(
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     optics.doe.load_exported_state(checkpoint["doe"])
     network.load_state_dict(checkpoint["network"])
+    fixed_psfs = None
+    fixed_psf_path = None
+    if config.optics.finetune_psf_mode == "exact":
+        fixed_psfs, fixed_psf_path = load_or_build_fixed_psf_map(
+            config.optics, optics, training_output
+        )
     loader = build_validation_loader(config.dataset, config.evaluation, config.training.seed)
     lpips_metric = LPIPSMetric(device) if config.evaluation.use_lpips else None
     metrics, sample = evaluate_reconstruction(
@@ -903,6 +962,7 @@ def run_checkpoint_evaluation(
         lpips_metric=lpips_metric,
         field_grid=config.evaluation.field_grid,
         local_field_patches=config.evaluation.local_field_patches,
+        fixed_psfs=fixed_psfs,
     )
 
     clean_path = output / "validation_clean.png"
@@ -936,6 +996,8 @@ def run_checkpoint_evaluation(
         "output": str(output),
         "device": str(device),
         "cache": cache_description(cache),
+        "finetune_psf_mode": config.optics.finetune_psf_mode,
+        "fixed_finetune_psf_cache": str(fixed_psf_path) if fixed_psf_path else None,
         "validation": metrics,
         "sources": PAPER_SOURCES,
         "claim_boundary": CLAIM_BOUNDARY,

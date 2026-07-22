@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.metadata
 import hashlib
 import inspect
+import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,7 @@ from .poly1d import Poly1DDOE
 
 
 _CACHE_VERSION = 2
+_FIXED_PSF_CACHE_VERSION = 1
 
 
 def _sha256(path: str | Path) -> str:
@@ -464,3 +467,264 @@ def cache_description(cache: dict[str, Any]) -> dict[str, Any]:
         "sensor_resolution": list(cache.get("sensor_resolution", ())),
         "doe_sensor_distance_mm": cache.get("doe_sensor_distance_mm"),
     }
+
+
+def _fixed_psf_signature(
+    config: OpticsConfig,
+    optics: CachedRayWaveOptics,
+    target_grid: int,
+) -> dict[str, Any]:
+    lens_path = Path(config.lens_file)
+    return {
+        "backend": config.backend,
+        "lens_file_sha256": _sha256(lens_path) if lens_path.exists() else None,
+        "depths_mm": list(config.depths_mm),
+        "wavelengths_rgb_um": [list(group) for group in config.wavelengths_rgb_um],
+        "target_field_grid": target_grid,
+        "simulation_grid": config.simulation_grid,
+        "psf_size": config.psf_size,
+        "coherent_rays": config.coherent_rays,
+        "doe_size_mm": config.doe_size_mm,
+        "f_number": config.f_number,
+        "sensor_resolution": list(config.sensor_resolution),
+        "focus_depth_mm": config.focus_depth_mm,
+        "propagation_distance_mm": optics.propagation_distance_mm,
+        "doe_normalization_radius_mm": float(optics.doe.doe_radius.detach().cpu()),
+        "design_wavelength_um": config.design_wavelength_um,
+        "design_refractive_index": config.design_refractive_index,
+        "quantization_levels": config.quantization_levels,
+        "quantize_during_training": config.quantize_during_training,
+        "propagation_precision": config.propagation_precision,
+        "doe_coefficients": [
+            float(value) for value in optics.doe.coefficients.detach().cpu()
+        ],
+    }
+
+
+def _save_fixed_psf_payload(payload: dict[str, Any], path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+    metadata_path = path.with_suffix(path.suffix + ".metadata.json")
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "format": payload["format"],
+                "version": payload["version"],
+                "signature": payload["signature"],
+                "fields_total": int(payload["completed_fields"].numel()),
+                "fields_completed": int(payload["completed_fields"].sum()),
+                "complete": bool(payload["completed_fields"].all()),
+                "psf_shape": list(payload["psfs"].shape),
+                "psf_dtype": str(payload["psfs"].dtype),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _validate_fixed_psf_payload(
+    payload: dict[str, Any],
+    signature: dict[str, Any],
+    target_grid: int,
+    config: OpticsConfig,
+) -> None:
+    if payload.get("format") != "edof_reproduction.fixed_psfs":
+        raise ValueError("fixed PSF cache has an unknown format")
+    if payload.get("version") != _FIXED_PSF_CACHE_VERSION:
+        raise ValueError("fixed PSF cache is outdated; rebuild it")
+    if payload.get("signature") != signature:
+        raise ValueError("fixed PSF cache does not match the lens, DOE, or configuration")
+    expected = (
+        len(config.depths_mm),
+        target_grid**2,
+        len(config.wavelengths_rgb_um),
+        config.psf_size,
+        config.psf_size,
+    )
+    if tuple(payload["psfs"].shape) != expected:
+        raise ValueError(f"fixed PSF shape {tuple(payload['psfs'].shape)} does not match {expected}")
+    if payload["psfs"].dtype != torch.float32:
+        raise ValueError("fixed PSFs must use float32")
+    if tuple(payload["completed_fields"].shape) != (target_grid**2,):
+        raise ValueError("fixed PSF completion map has the wrong shape")
+
+
+def _exact_analytic_psfs(
+    config: OpticsConfig,
+    optics: CachedRayWaveOptics,
+    target_grid: int,
+) -> Tensor:
+    exact_config = replace(config, field_grid=target_grid)
+    exact_cache = _analytic_cache(exact_config)
+    exact_optics = CachedRayWaveOptics(
+        exact_config, exact_cache, optics.device_for_compute
+    ).to(optics.device_for_compute)
+    exact_optics.doe.set_coefficients(optics.doe.coefficients.detach())
+    return exact_optics.psfs(((0, 1, 2), (3, 4, 5), (6, 7, 8))).detach().cpu()
+
+
+def _fill_exact_deeplens_psfs(
+    config: OpticsConfig,
+    optics: CachedRayWaveOptics,
+    payload: dict[str, Any],
+    path: Path,
+    target_grid: int,
+) -> None:
+    try:
+        from deeplens import HybridLens
+    except ImportError as exc:
+        raise RuntimeError("DeepLens is required to compute the exact fixed PSF map") from exc
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        cache_device = config.cache_device
+        if cache_device == "auto":
+            cache_device = "cuda" if torch.cuda.is_available() else "cpu"
+        if cache_device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA PSF generation was requested but is unavailable")
+        lens = HybridLens(filename=config.lens_file, device=cache_device)
+        lens.refocus(config.focus_depth_mm)
+        if hasattr(lens.geolens, "set_fnum"):
+            lens.geolens.set_fnum(config.f_number)
+        lens.doe.res = (config.simulation_grid, config.simulation_grid)
+        lens.doe.ps = config.doe_size_mm / config.simulation_grid
+        lens.doe.w = config.doe_size_mm
+        lens.doe.h = config.doe_size_mm
+        propagation_distance = float(lens.geolens.d_sensor - lens.doe.d)
+        if not math.isclose(
+            propagation_distance,
+            optics.propagation_distance_mm,
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            raise ValueError("exact PSF lens spacing does not match the training optical cache")
+
+        target_complex = (
+            torch.complex128
+            if config.propagation_precision == "float64"
+            else torch.complex64
+        )
+        phase_dtype = torch.float64 if target_complex == torch.complex128 else torch.float32
+        phase_maps = {
+            float(wavelength): optics._phase(float(wavelength)).detach().to(dtype=phase_dtype)
+            for group in config.wavelengths_rgb_um
+            for wavelength in group
+        }
+        fields_xy = _field_coordinates(target_grid)
+        completed = payload["completed_fields"]
+        psfs = payload["psfs"]
+        save_every = config.finetune_psf_save_every_fields
+        total_fields = len(fields_xy)
+        try:
+            with torch.no_grad():
+                for field_index, (field_x, field_y) in enumerate(fields_xy):
+                    if bool(completed[field_index]):
+                        continue
+                    for depth_index, depth in enumerate(config.depths_mm):
+                        point = torch.tensor([field_x, field_y, depth])
+                        for channel_index, wavelengths in enumerate(config.wavelengths_rgb_um):
+                            channel_psf = torch.zeros(
+                                config.psf_size, config.psf_size, dtype=torch.float32
+                            )
+                            for wavelength in wavelengths:
+                                wavefront, center = _call_doe_field(
+                                    lens,
+                                    point=point,
+                                    wavelength=float(wavelength),
+                                    coherent_rays=config.coherent_rays,
+                                )
+                                wavefront = wavefront.squeeze()
+                                expected_grid = (config.simulation_grid, config.simulation_grid)
+                                if tuple(wavefront.shape) != expected_grid:
+                                    raise RuntimeError(
+                                        f"DeepLens returned field shape {tuple(wavefront.shape)}; "
+                                        f"expected {expected_grid}"
+                                    )
+                                field = wavefront[None].to(
+                                    device=optics.device_for_compute, dtype=target_complex
+                                )
+                                center_tensor = torch.as_tensor(
+                                    center,
+                                    device=optics.device_for_compute,
+                                    dtype=phase_dtype,
+                                ).reshape(1, 2)
+                                propagated = optics._propagate_chunk(
+                                    field,
+                                    phase_maps[float(wavelength)],
+                                    center_tensor,
+                                    float(wavelength),
+                                )[0]
+                                channel_psf.add_(propagated.detach().cpu() / len(wavelengths))
+                            psfs[depth_index, field_index, channel_index].copy_(channel_psf)
+                    completed[field_index] = True
+                    completed_count = int(completed.sum())
+                    print(
+                        json.dumps(
+                            {
+                                "fixed_psf_progress": {
+                                    "fields_completed": completed_count,
+                                    "fields_total": total_fields,
+                                    "field": [field_x, field_y],
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    if completed_count % save_every == 0 or completed_count == total_fields:
+                        _save_fixed_psf_payload(payload, path)
+        except BaseException:
+            _save_fixed_psf_payload(payload, path)
+            raise
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+def load_or_build_fixed_psf_map(
+    config: OpticsConfig,
+    optics: CachedRayWaveOptics,
+    output_dir: Path,
+    *,
+    force: bool = False,
+) -> tuple[Tensor, Path]:
+    """Load or compute a true field-sampled fixed PSF map for network fine-tuning."""
+
+    target_grid = config.finetune_field_grid or config.field_grid
+    path = output_dir / config.finetune_psf_cache_file
+    signature = _fixed_psf_signature(config, optics, target_grid)
+    if path.exists() and not force:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        _validate_fixed_psf_payload(payload, signature, target_grid, config)
+    else:
+        payload = {
+            "format": "edof_reproduction.fixed_psfs",
+            "version": _FIXED_PSF_CACHE_VERSION,
+            "signature": signature,
+            "fields_xy": _field_coordinates(target_grid),
+            "psfs": torch.zeros(
+                len(config.depths_mm),
+                target_grid**2,
+                len(config.wavelengths_rgb_um),
+                config.psf_size,
+                config.psf_size,
+                dtype=torch.float32,
+            ),
+            "completed_fields": torch.zeros(target_grid**2, dtype=torch.bool),
+        }
+        _save_fixed_psf_payload(payload, path)
+
+    if not bool(payload["completed_fields"].all()):
+        if config.backend == "analytic":
+            payload["psfs"].copy_(_exact_analytic_psfs(config, optics, target_grid))
+            payload["completed_fields"].fill_(True)
+            _save_fixed_psf_payload(payload, path)
+        else:
+            _fill_exact_deeplens_psfs(config, optics, payload, path, target_grid)
+    _validate_fixed_psf_payload(payload, signature, target_grid, config)
+    if not bool(payload["completed_fields"].all()):
+        raise RuntimeError("fixed PSF map is incomplete")
+    return payload["psfs"], path

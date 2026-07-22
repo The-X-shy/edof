@@ -18,6 +18,7 @@ from edof_reproduction.config import (
     OutputConfig,
     TrainingConfig,
     load_config,
+    validate_config,
 )
 from edof_reproduction.dataset import DIV2KDataset
 from edof_reproduction.imaging import interpolate_psf_grid, spatial_convolution, wavelength_choice
@@ -26,6 +27,7 @@ from edof_reproduction.optics import (
     _call_doe_field,
     _field_coordinates,
     load_or_build_cache,
+    load_or_build_fixed_psf_map,
 )
 from edof_reproduction.runner import (
     _loss_from_psfs,
@@ -87,6 +89,32 @@ def test_optimized_config_matches_disclosed_edof_schedule() -> None:
     assert config.training.pixel_loss_weight == 0.3
     assert config.training.cross_depth_loss_weight == 1.0
     assert config.training.local_field_patches
+
+
+def test_practical_config_uses_exact_psfs_and_perceptual_finetune() -> None:
+    config = load_config("configs/edof_reproduction/windows_practical_finetune.yaml")
+    assert (config.training.joint_epochs, config.training.finetune_epochs) == (0, 50)
+    assert config.optics.simulation_grid == 512
+    assert config.optics.finetune_field_grid == 40
+    assert config.optics.finetune_psf_mode == "exact"
+    assert config.training.initialize_from.endswith("windows_optimized/checkpoints/best.pt")
+    assert config.training.pixel_loss_type == "mse"
+    assert config.training.perceptual_weight == 0.1
+    assert config.training.cross_depth_loss_weight == 0.1
+
+
+def test_resume_and_initialize_from_are_mutually_exclusive(tmp_path: Path) -> None:
+    config = tiny_config(tmp_path, epochs=1)
+    config = replace(
+        config,
+        training=replace(config.training, resume="latest.pt", initialize_from="best.pt"),
+    )
+    try:
+        validate_config(config)
+    except ValueError as error:
+        assert "mutually exclusive" in str(error)
+    else:
+        raise AssertionError("conflicting checkpoint modes were accepted")
 
 
 def test_analytic_optics_is_differentiable(tmp_path: Path) -> None:
@@ -233,6 +261,31 @@ def test_psf_map_interpolation_is_normalized() -> None:
     assert torch.allclose(result.sum(dim=(-2, -1)), torch.ones(3, 100, 3), atol=1e-6)
 
 
+def test_exact_fixed_psf_map_is_field_sampled_normalized_and_reusable(tmp_path: Path) -> None:
+    base = tiny_config(tmp_path, epochs=1)
+    optics_config = replace(
+        base.optics,
+        finetune_field_grid=2,
+        finetune_psf_mode="exact",
+        finetune_psf_cache_file="exact_psfs.pt",
+        finetune_psf_save_every_fields=1,
+    )
+    cache_output = tmp_path / "exact-cache"
+    cache_output.mkdir()
+    cache, _ = load_or_build_cache(optics_config, cache_output)
+    optics = CachedRayWaveOptics(optics_config, cache, torch.device("cpu"))
+    optics.doe.set_coefficients((0.2, 0.1, -0.1, 0.03, 0.02, -0.01))
+    psfs, path = load_or_build_fixed_psf_map(optics_config, optics, cache_output)
+    assert psfs.shape == (3, 4, 3, 5, 5)
+    assert torch.allclose(psfs.sum(dim=(-2, -1)), torch.ones(3, 4, 3), atol=1e-5)
+    repeated, repeated_path = load_or_build_fixed_psf_map(optics_config, optics, cache_output)
+    assert repeated_path == path
+    assert torch.equal(repeated, psfs)
+    metadata = json.loads(path.with_suffix(".pt.metadata.json").read_text(encoding="utf-8"))
+    assert metadata["complete"] is True
+    assert metadata["fields_completed"] == 4
+
+
 def test_training_wavelengths_are_independent_and_replayable() -> None:
     choices = [wavelength_choice(step, averaged=False) for step in range(40)]
     assert choices == [wavelength_choice(step, averaged=False) for step in range(40)]
@@ -357,6 +410,35 @@ def test_local_field_fixed_optics_finetune_runs(tmp_path: Path) -> None:
     assert result["epochs_completed"] == 2
     assert result["joint_epochs"] == 1
     assert result["finetune_epochs"] == 1
+
+
+def test_initialize_from_starts_independent_exact_finetune(tmp_path: Path) -> None:
+    base = tiny_config(tmp_path, epochs=1)
+    source_output = tmp_path / "source"
+    run_training(base, output_override=source_output)
+    source_checkpoint = source_output / "checkpoints" / "latest.pt"
+    config = replace(
+        base,
+        optics=replace(
+            base.optics,
+            finetune_field_grid=2,
+            finetune_psf_mode="exact",
+            finetune_psf_cache_file="exact_psfs.pt",
+        ),
+        training=replace(
+            base.training,
+            joint_epochs=0,
+            finetune_epochs=1,
+            initialize_from=str(source_checkpoint),
+            psf_pretrain_steps=3,
+            local_field_patches=True,
+        ),
+    )
+    result = run_training(config, output_override=tmp_path / "independent-finetune")
+    assert result["epochs_completed"] == 1
+    assert result["initialized_from"] == str(source_checkpoint)
+    assert result["pretrain_steps"] == 0
+    assert result["finetune_psf_mode"] == "exact"
 
 
 def test_memory_smoke_runs_real_backward_and_reports_cache(tmp_path: Path) -> None:

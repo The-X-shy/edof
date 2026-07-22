@@ -90,6 +90,37 @@ The paper's 6000-point wave grid cannot run on an RTX 5060 8 GB card. The
 5x5/512 configuration keeps cached fields in host memory and computes one local
 field patch per training sample so the disclosed model can run on this GPU.
 
+## RTX 5060 practical fine-tune
+
+`windows_practical_finetune.yaml` starts a new 50-epoch network fine-tune from
+the best checkpoint in `windows_optimized`. It keeps the 512-point wave grid,
+but traces every one of the 40x40 field positions instead of interpolating the
+5x5 PSF map. The approximately 230 MB fixed PSF cache is saved every 100 field
+positions and resumes after interruption.
+
+The practical loss is reconstruction MSE plus VGG16 perceptual loss and a
+smaller cross-depth consistency term. This targets visible reconstruction
+quality on the 8 GB card and is intentionally not described as the paper's
+strict loss.
+
+Run the short two-by-two field and one-batch check first:
+
+```powershell
+.\.venv-edof\Scripts\python.exe -m edof_reproduction `
+  --config configs\edof_reproduction\windows_practical_memory.yaml `
+  --output workspace\edof_reproduction\windows_practical_memory
+```
+
+Start the full detached run with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\windows_edof_start.ps1 `
+  -TaskName EDOFPracticalFinetune `
+  -Config configs\edof_reproduction\windows_practical_finetune.yaml `
+  -OutputName windows_practical_finetune
+```
+
 Evaluate an existing checkpoint without training:
 
 ```powershell

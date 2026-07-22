@@ -26,10 +26,17 @@ def evaluate_reconstruction(
     lpips_metric: LPIPSMetric | None = None,
     field_grid: int | None = None,
     local_field_patches: bool = False,
+    fixed_psfs: Tensor | None = None,
 ) -> tuple[dict[str, Any], dict[str, Tensor]]:
     network.eval()
-    psfs = optics.psfs(wavelength_choice(0, averaged=True)).detach()
-    psfs = interpolate_psf_grid(psfs, field_grid).detach()
+    if fixed_psfs is None:
+        psfs = optics.psfs(wavelength_choice(0, averaged=True)).detach()
+        psfs = interpolate_psf_grid(psfs, field_grid).detach()
+    else:
+        psfs = fixed_psfs.detach()
+        expected_prefix = (len(depths_mm), 3)
+        if psfs.ndim != 5 or (psfs.shape[0], psfs.shape[2]) != expected_prefix:
+            raise ValueError("fixed PSFs must have shape [depth, field, RGB, kernel, kernel]")
     metric = lpips_metric
     if use_lpips and metric is None:
         metric = LPIPSMetric(device)
@@ -47,6 +54,7 @@ def evaluate_reconstruction(
             if local_field_patches:
                 field_index = batch_index % depth_psfs.shape[0]
                 depth_psfs = depth_psfs[field_index : field_index + 1]
+            depth_psfs = depth_psfs.to(device, non_blocking=True)
             sensor = spatial_convolution(clean, depth_psfs)
             if noise_std > 0.0:
                 noise = torch.randn(

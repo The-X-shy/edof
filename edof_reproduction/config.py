@@ -32,6 +32,9 @@ class OpticsConfig:
     sensor_resolution: tuple[int, int] = (1000, 1000)
     doe_normalization_radius_mm: float | None = None
     finetune_field_grid: int | None = None
+    finetune_psf_mode: str = "interpolate"
+    finetune_psf_cache_file: str = "fixed_psf_map.pt"
+    finetune_psf_save_every_fields: int = 100
     design_wavelength_um: float = 0.55
     design_refractive_index: float = 1.4599
     quantization_levels: int = 16
@@ -106,6 +109,7 @@ class TrainingConfig:
     checkpoint_every: int = 1
     log_every_batches: int = 100
     resume: str | None = None
+    initialize_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,12 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("f_number must be positive")
     if optics.finetune_field_grid is not None and optics.finetune_field_grid < optics.field_grid:
         raise ValueError("finetune_field_grid must be at least field_grid")
+    if optics.finetune_psf_mode not in {"interpolate", "exact"}:
+        raise ValueError("finetune_psf_mode must be interpolate or exact")
+    if not optics.finetune_psf_cache_file:
+        raise ValueError("finetune_psf_cache_file must not be empty")
+    if optics.finetune_psf_save_every_fields < 1:
+        raise ValueError("finetune_psf_save_every_fields must be positive")
     if optics.propagation_precision not in {"float32", "float64"}:
         raise ValueError("propagation_precision must be float32 or float64")
     if optics.propagation_batch_size is not None and optics.propagation_batch_size < 1:
@@ -193,6 +203,10 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("epoch counts must be non-negative")
     if training.joint_epochs + training.finetune_epochs == 0:
         raise ValueError("at least one training epoch is required")
+    if training.resume and training.initialize_from:
+        raise ValueError("training.resume and training.initialize_from are mutually exclusive")
+    if optics.finetune_psf_mode == "exact" and training.finetune_epochs == 0:
+        raise ValueError("exact finetune PSFs require at least one finetune epoch")
     if training.accumulation_steps < 1 or dataset.batch_size < 1:
         raise ValueError("batch and accumulation sizes must be positive")
     if training.checkpoint_every < 1 or training.log_every_batches < 1:
