@@ -22,6 +22,7 @@ from edof_reproduction.config import (
 )
 from edof_reproduction.dataset import DIV2KDataset
 from edof_reproduction.convergence import (
+    build_strict_finetune_config,
     crop_normalized_psfs,
     mean_edge_energy,
     select_optical_settings,
@@ -279,6 +280,35 @@ def test_convergence_selection_keeps_compact_settings_when_converged() -> None:
     assert decision["selected_psf_size"] == 63
     assert not decision["grid_limited"]
     assert decision["primary_bottleneck"] == "proxy_lens_parameters"
+
+
+def test_convergence_decision_preserves_strict_paper_finetune() -> None:
+    base = load_config("configs/edof_reproduction/windows_strict_finetune.yaml")
+    config = build_strict_finetune_config(
+        base,
+        {
+            "selected_simulation_grid": 768,
+            "selected_psf_size": 127,
+        },
+        cache_file="../convergence/cache_768.pt",
+        fixed_psf_cache_file="fixed_40x40_768_k127.pt",
+        initialize_from="joint_epoch_050.pt",
+    )
+    assert config.optics.field_grid == 3
+    assert config.optics.simulation_grid == 768
+    assert config.optics.psf_size == 127
+    assert config.optics.finetune_field_grid == 40
+    assert config.optics.finetune_psf_mode == "exact"
+    assert config.training.initialize_from == "joint_epoch_050.pt"
+    assert (config.training.joint_epochs, config.training.finetune_epochs) == (0, 50)
+    assert config.training.pixel_loss_type == "rmse"
+    assert config.training.pixel_loss_weight == 0.3
+    assert config.training.cross_depth_loss_weight == 1.0
+    assert config.training.perceptual_weight == 0.0
+    assert config.dataset.crop_size == 128
+    assert config.evaluation.crop_size == 1000
+    assert config.evaluation.field_grid == 40
+    assert not config.evaluation.local_field_patches
 
 
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:

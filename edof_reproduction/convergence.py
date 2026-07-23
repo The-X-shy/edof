@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Iterable
 
 import torch
 from torch import Tensor
+
+from .config import EDOFConfig, validate_config
 
 
 def crop_normalized_psfs(psfs: Tensor, target_size: int) -> Tensor:
@@ -108,3 +111,54 @@ def select_optical_settings(
             "psf_range": psf_threshold_db,
         },
     }
+
+
+def build_strict_finetune_config(
+    base: EDOFConfig,
+    decision: dict[str, Any],
+    *,
+    cache_file: str,
+    fixed_psf_cache_file: str,
+    initialize_from: str,
+) -> EDOFConfig:
+    """Apply a convergence decision without changing the disclosed paper loss."""
+
+    simulation_grid = int(decision["selected_simulation_grid"])
+    psf_size = int(decision["selected_psf_size"])
+    config = replace(
+        base,
+        optics=replace(
+            base.optics,
+            cache_file=cache_file,
+            field_grid=3,
+            simulation_grid=simulation_grid,
+            psf_size=psf_size,
+            finetune_field_grid=40,
+            finetune_psf_mode="exact",
+            finetune_psf_cache_file=fixed_psf_cache_file,
+            propagation_batch_size=1,
+        ),
+        dataset=replace(base.dataset, crop_size=128),
+        evaluation=replace(
+            base.evaluation,
+            crop_size=1000,
+            max_images=100,
+            field_grid=40,
+            local_field_patches=False,
+        ),
+        training=replace(
+            base.training,
+            joint_epochs=0,
+            finetune_epochs=50,
+            warmup_epochs=0,
+            pixel_loss_weight=0.3,
+            perceptual_weight=0.0,
+            pixel_loss_type="rmse",
+            cross_depth_loss_weight=1.0,
+            local_field_patches=True,
+            resume=None,
+            initialize_from=initialize_from,
+        ),
+    )
+    validate_config(config)
+    return config
