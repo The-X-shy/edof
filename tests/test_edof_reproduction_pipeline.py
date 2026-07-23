@@ -311,6 +311,15 @@ def test_convergence_decision_preserves_strict_paper_finetune() -> None:
     assert not config.evaluation.local_field_patches
 
 
+def test_strict_background_workers_expose_project_to_python() -> None:
+    for name in (
+        "windows_strict_optics_worker.ps1",
+        "windows_strict_finetune_worker.ps1",
+    ):
+        source = Path("scripts", name).read_text(encoding="utf-8")
+        assert "$env:PYTHONPATH = $ProjectRoot" in source
+
+
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:
     class FakeLens:
         def __init__(self) -> None:

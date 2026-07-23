@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 Set-Location $ProjectRoot
 $env:TORCH_HOME = Join-Path $ProjectRoot "torch-cache"
 $env:PYTHONUTF8 = "1"
+$env:PYTHONPATH = $ProjectRoot
 $Python = Join-Path $ProjectRoot ".venv-edof\Scripts\python.exe"
 $Runner = Join-Path $ProjectRoot "scripts\run_strict_optics_convergence.py"
 $EvaluationOutput = Join-Path $ProjectRoot "workspace\edof_reproduction\windows_strict_full_fov_evaluation"
