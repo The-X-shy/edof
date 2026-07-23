@@ -9,8 +9,8 @@ from torch import Tensor
 from torch.nn import functional as F
 
 
-def spatial_convolution(image: Tensor, psfs: Tensor) -> Tensor:
-    """Apply one RGB PSF per field cell without convolving unused image regions."""
+def _spatial_convolution_loop(image: Tensor, psfs: Tensor) -> Tensor:
+    """Reference implementation for irregular image sizes."""
 
     field_count, channels, kernel, _ = psfs.shape
     radius = kernel // 2
@@ -37,6 +37,84 @@ def spatial_convolution(image: Tensor, psfs: Tensor) -> Tensor:
             groups=channels,
         )
     return output
+
+
+def spatial_convolution(
+    image: Tensor,
+    psfs: Tensor,
+    *,
+    field_chunk_size: int = 256,
+) -> Tensor:
+    """Apply a spatial PSF map while evaluating every field cell.
+
+    Full-resolution paper evaluation uses a 40x40 PSF map over a
+    1000x1000 sensor. Calling ``conv2d`` once per cell is prohibitively slow,
+    so divisible image grids are unfolded into field patches and processed in
+    grouped chunks. Irregular image sizes retain the reference path.
+    """
+
+    field_count, channels, kernel, _ = psfs.shape
+    if image.ndim != 4 or image.shape[1] != channels:
+        raise ValueError("image and PSF channel counts must match")
+    if field_chunk_size < 1:
+        raise ValueError("field_chunk_size must be positive")
+    if field_count == 1:
+        return _spatial_convolution_loop(image, psfs)
+
+    side = round(math.sqrt(field_count))
+    if side * side != field_count:
+        raise ValueError("field count must be a square grid")
+    height, width = image.shape[-2:]
+    if height % side or width % side:
+        return _spatial_convolution_loop(image, psfs)
+
+    radius = kernel // 2
+    tile_height, tile_width = height // side, width // side
+    padding_mode = "reflect" if min(height, width) > radius else "replicate"
+    padded = F.pad(image, (radius, radius, radius, radius), mode=padding_mode)
+    patches = (
+        padded.unfold(2, tile_height + 2 * radius, tile_height)
+        .unfold(3, tile_width + 2 * radius, tile_width)
+        .permute(0, 2, 3, 1, 4, 5)
+        .contiguous()
+    )
+    batch_size = image.shape[0]
+    patches = patches.reshape(
+        batch_size * field_count * channels,
+        1,
+        tile_height + 2 * radius,
+        tile_width + 2 * radius,
+    )
+    flipped = torch.flip(psfs, dims=(-2, -1))
+    filters = (
+        flipped.unsqueeze(0)
+        .expand(batch_size, -1, -1, -1, -1)
+        .reshape(batch_size * field_count * channels, 1, kernel, kernel)
+    )
+    outputs = []
+    for start in range(0, patches.shape[0], field_chunk_size):
+        stop = min(start + field_chunk_size, patches.shape[0])
+        count = stop - start
+        grouped_input = patches[start:stop].permute(1, 0, 2, 3)
+        grouped_output = F.conv2d(
+            grouped_input,
+            filters[start:stop],
+            groups=count,
+        )
+        outputs.append(grouped_output[0])
+    output = torch.cat(outputs).reshape(
+        batch_size,
+        side,
+        side,
+        channels,
+        tile_height,
+        tile_width,
+    )
+    return (
+        output.permute(0, 3, 1, 4, 2, 5)
+        .contiguous()
+        .reshape(batch_size, channels, height, width)
+    )
 
 
 def interpolate_psf_grid(psfs: Tensor, target_side: int | None) -> Tensor:

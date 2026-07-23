@@ -21,7 +21,12 @@ from edof_reproduction.config import (
     validate_config,
 )
 from edof_reproduction.dataset import DIV2KDataset
-from edof_reproduction.imaging import interpolate_psf_grid, spatial_convolution, wavelength_choice
+from edof_reproduction.imaging import (
+    _spatial_convolution_loop,
+    interpolate_psf_grid,
+    spatial_convolution,
+    wavelength_choice,
+)
 from edof_reproduction.optics import (
     CachedRayWaveOptics,
     _call_doe_field,
@@ -131,6 +136,31 @@ def test_recommended_sequence_configs_share_exact_cache_and_initialization() -> 
         )
 
 
+def test_strict_configs_use_full_field_evaluation_and_paper_loss() -> None:
+    evaluation = load_config(
+        "configs/edof_reproduction/windows_strict_full_fov_eval.yaml"
+    )
+    assert evaluation.evaluation.crop_size == 1000
+    assert evaluation.evaluation.field_grid == 40
+    assert not evaluation.evaluation.local_field_patches
+    assert evaluation.optics.finetune_psf_mode == "exact"
+
+    finetune = load_config("configs/edof_reproduction/windows_strict_finetune.yaml")
+    assert (finetune.training.joint_epochs, finetune.training.finetune_epochs) == (
+        0,
+        50,
+    )
+    assert finetune.training.pixel_loss_type == "rmse"
+    assert finetune.training.pixel_loss_weight == 0.3
+    assert finetune.training.perceptual_weight == 0.0
+    assert finetune.training.cross_depth_loss_weight == 1.0
+    assert finetune.training.initialize_from.endswith(
+        "windows_optimized/checkpoints/epoch_050.pt"
+    )
+    assert finetune.evaluation.crop_size == 1000
+    assert not finetune.evaluation.local_field_patches
+
+
 def test_resume_and_initialize_from_are_mutually_exclusive(tmp_path: Path) -> None:
     config = tiny_config(tmp_path, epochs=1)
     config = replace(
@@ -179,6 +209,27 @@ def test_field_grid_matches_deeplens_patch_centres() -> None:
     assert fields[0] == (-0.875, 0.875)
     assert fields[4] == (0.875, 0.875)
     assert fields[-1] == (0.875, -0.875)
+
+
+def test_vectorized_full_field_convolution_matches_reference() -> None:
+    generator = torch.Generator().manual_seed(240608)
+    image = torch.rand(2, 3, 8, 10, generator=generator)
+    psfs = torch.rand(4, 3, 3, 3, generator=generator)
+    psfs = psfs / psfs.sum(dim=(-2, -1), keepdim=True)
+    expected = _spatial_convolution_loop(image, psfs)
+    actual = spatial_convolution(image, psfs, field_chunk_size=5)
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_full_field_convolution_rejects_invalid_chunk_size() -> None:
+    image = torch.ones(1, 3, 8, 8)
+    psfs = torch.ones(4, 3, 3, 3) / 9.0
+    try:
+        spatial_convolution(image, psfs, field_chunk_size=0)
+    except ValueError as error:
+        assert "positive" in str(error)
+    else:
+        raise AssertionError("invalid field chunk size was accepted")
 
 
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:
