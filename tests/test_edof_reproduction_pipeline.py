@@ -41,6 +41,7 @@ from edof_reproduction.optics import (
     load_or_build_fixed_psf_map,
 )
 from edof_reproduction.runner import (
+    _contiguous_psf_subgrid,
     _loss_from_psfs,
     _psf_pretrain_loss,
     run_memory_smoke,
@@ -282,6 +283,30 @@ def test_convergence_selection_keeps_compact_settings_when_converged() -> None:
     assert decision["primary_bottleneck"] == "proxy_lens_parameters"
 
 
+def test_convergence_selection_expands_a_truncated_compact_psf() -> None:
+    cases = [
+        {
+            "simulation_grid": grid,
+            "psf_size": psf_size,
+            "mean_raw_psnr": psnr,
+            "mean_edge_energy": edge,
+        }
+        for grid, psf_size, psnr, edge in (
+            (512, 63, 16.72, 0.188),
+            (512, 127, 16.73, 0.012),
+            (768, 63, 17.02, 0.153),
+            (768, 127, 16.79, 0.008),
+            (1024, 63, 17.40, 0.126),
+            (1024, 127, 17.04, 0.009),
+        )
+    ]
+    decision = select_optical_settings(cases)
+    assert decision["selected_simulation_grid"] == 1024
+    assert decision["selected_psf_size"] == 127
+    assert decision["compact_psf_truncated"]
+    assert decision["compact_psf_edge_energy"] == 0.126
+
+
 def test_convergence_decision_preserves_strict_paper_finetune() -> None:
     base = load_config("configs/edof_reproduction/windows_strict_finetune.yaml")
     config = build_strict_finetune_config(
@@ -311,13 +336,44 @@ def test_convergence_decision_preserves_strict_paper_finetune() -> None:
     assert not config.evaluation.local_field_patches
 
 
+def test_corrected_strict_finetune_preserves_sensor_field_cell_size() -> None:
+    base = load_config("configs/edof_reproduction/windows_strict_finetune.yaml")
+    config = build_strict_finetune_config(
+        base,
+        {
+            "selected_simulation_grid": 1024,
+            "selected_psf_size": 127,
+        },
+        cache_file="../convergence/cache_1024.pt",
+        fixed_psf_cache_file="fixed_40x40_1024_k127.pt",
+        initialize_from="joint_epoch_050.pt",
+        training_crop_size=125,
+        spatial_field_crop_grid=5,
+    )
+    assert config.dataset.crop_size == 125
+    assert config.training.spatial_field_crop_grid == 5
+    assert config.dataset.crop_size // config.training.spatial_field_crop_grid == 25
+    assert config.optics.sensor_resolution[0] // config.optics.finetune_field_grid == 25
+
+
 def test_strict_background_workers_expose_project_to_python() -> None:
     for name in (
         "windows_strict_optics_worker.ps1",
         "windows_strict_finetune_worker.ps1",
+        "windows_strict_spatial_finetune_worker.ps1",
     ):
         source = Path("scripts", name).read_text(encoding="utf-8")
         assert "$env:PYTHONPATH = $ProjectRoot" in source
+
+
+def test_contiguous_psf_subgrid_is_row_major_and_cycles() -> None:
+    psfs = torch.arange(3 * 16, dtype=torch.float32).reshape(3, 16, 1, 1, 1)
+    first = _contiguous_psf_subgrid(psfs, patch_side=2, step=0)
+    middle = _contiguous_psf_subgrid(psfs, patch_side=2, step=4)
+    wrapped = _contiguous_psf_subgrid(psfs, patch_side=2, step=9)
+    assert first[0, :, 0, 0, 0].tolist() == [0.0, 1.0, 4.0, 5.0]
+    assert middle[0, :, 0, 0, 0].tolist() == [5.0, 6.0, 9.0, 10.0]
+    assert torch.equal(first, wrapped)
 
 
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:
@@ -588,6 +644,7 @@ def test_initialize_from_starts_independent_exact_finetune(tmp_path: Path) -> No
         base,
         optics=replace(
             base.optics,
+            sensor_resolution=(16, 16),
             finetune_field_grid=2,
             finetune_psf_mode="exact",
             finetune_psf_cache_file="exact_psfs.pt",
@@ -599,6 +656,7 @@ def test_initialize_from_starts_independent_exact_finetune(tmp_path: Path) -> No
             initialize_from=str(source_checkpoint),
             psf_pretrain_steps=3,
             local_field_patches=True,
+            spatial_field_crop_grid=2,
         ),
     )
     result = run_training(config, output_override=tmp_path / "independent-finetune")

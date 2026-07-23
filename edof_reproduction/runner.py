@@ -106,6 +106,28 @@ def _pairwise_rmse(values: list[Tensor]) -> Tensor:
     return torch.stack(losses).mean()
 
 
+def _contiguous_psf_subgrid(psfs: Tensor, patch_side: int, step: int) -> Tensor:
+    """Select one deterministic contiguous square from a full PSF field map."""
+
+    if psfs.ndim != 5:
+        raise ValueError("psfs must have shape [depth, field, channels, kernel, kernel]")
+    field_count = int(psfs.shape[1])
+    source_side = round(math.sqrt(field_count))
+    if source_side * source_side != field_count:
+        raise ValueError("field count must be a square grid")
+    if patch_side < 1 or patch_side > source_side:
+        raise ValueError("patch_side must fit within the source field grid")
+    positions_per_axis = source_side - patch_side + 1
+    position = int(step) % (positions_per_axis * positions_per_axis)
+    top, left = divmod(position, positions_per_axis)
+    indices = [
+        (top + row) * source_side + left + column
+        for row in range(patch_side)
+        for column in range(patch_side)
+    ]
+    return psfs[:, indices]
+
+
 def _loss_from_psfs(
     clean: Tensor,
     psfs: Tensor,
@@ -527,7 +549,13 @@ def run_training(
                 )
             else:
                 batch_psfs = fixed_finetune_psfs
-                if config.training.local_field_patches:
+                if config.training.spatial_field_crop_grid is not None:
+                    batch_psfs = _contiguous_psf_subgrid(
+                        fixed_finetune_psfs,
+                        config.training.spatial_field_crop_grid,
+                        global_step,
+                    )
+                elif config.training.local_field_patches:
                     field_index = global_step % fixed_finetune_psfs.shape[1]
                     batch_psfs = fixed_finetune_psfs[:, field_index : field_index + 1]
                 batch_psfs = batch_psfs.to(device, non_blocking=True)

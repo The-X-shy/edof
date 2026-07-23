@@ -101,6 +101,7 @@ class TrainingConfig:
     cross_depth_loss_weight: float = 0.0
     depth_loss_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
     local_field_patches: bool = False
+    spatial_field_crop_grid: int | None = None
     gradient_clip: float = 1.0
     sensor_noise_std: float = 0.01
     psf_pretrain_steps: int = 0
@@ -225,6 +226,30 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("training.cross_depth_loss_weight must be non-negative")
     if len(training.depth_loss_weights) != len(optics.depths_mm) or min(training.depth_loss_weights) <= 0:
         raise ValueError("training.depth_loss_weights must provide one positive weight per depth")
+    if training.spatial_field_crop_grid is not None:
+        patch_grid = training.spatial_field_crop_grid
+        field_grid = optics.finetune_field_grid
+        sensor_height, sensor_width = optics.sensor_resolution
+        if patch_grid < 2:
+            raise ValueError("training.spatial_field_crop_grid must be at least two")
+        if not training.local_field_patches:
+            raise ValueError("spatial field crops require training.local_field_patches")
+        if field_grid is None or patch_grid > field_grid:
+            raise ValueError(
+                "spatial field crops require a compatible optics.finetune_field_grid"
+            )
+        if sensor_height % field_grid or sensor_width % field_grid:
+            raise ValueError("sensor resolution must be divisible by finetune_field_grid")
+        if dataset.crop_size % patch_grid:
+            raise ValueError("dataset crop_size must be divisible by spatial_field_crop_grid")
+        training_tile = dataset.crop_size // patch_grid
+        if (
+            training_tile != sensor_height // field_grid
+            or training_tile != sensor_width // field_grid
+        ):
+            raise ValueError(
+                "training crop and PSF subgrid must preserve the full-sensor field-cell size"
+            )
     if training.psf_pretrain_size_weight < 0.0 or training.psf_pretrain_similarity_weight < 0.0:
         raise ValueError("PSF pretraining weights must be non-negative")
     if training.psf_pretrain_steps > 0 and (

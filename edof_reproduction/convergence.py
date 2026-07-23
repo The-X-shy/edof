@@ -43,17 +43,18 @@ def select_optical_settings(
     convergence_threshold_db: float = 0.1,
     grid_limited_threshold_db: float = 0.3,
     psf_threshold_db: float = 0.1,
+    psf_edge_energy_threshold: float = 0.01,
 ) -> dict[str, Any]:
-    """Apply the predeclared grid and PSF-size gates to measured raw PSNR."""
+    """Apply the grid, image-quality, and PSF-support gates."""
 
     rows = list(cases)
     if not rows:
         raise ValueError("at least one optical convergence case is required")
+    case_lookup = {
+        (int(row["simulation_grid"]), int(row["psf_size"])): row for row in rows
+    }
     lookup = {
-        (int(row["simulation_grid"]), int(row["psf_size"])): float(
-            row["mean_raw_psnr"]
-        )
-        for row in rows
+        key: float(row["mean_raw_psnr"]) for key, row in case_lookup.items()
     }
     grids = sorted({key[0] for key in lookup})
     psf_sizes = sorted({key[1] for key in lookup})
@@ -87,7 +88,14 @@ def select_optical_settings(
         lookup[(selected_grid, largest_psf)]
         - lookup[(selected_grid, compact_psf)]
     )
-    selected_psf = largest_psf if psf_gain > psf_threshold_db else compact_psf
+    compact_case = case_lookup[(selected_grid, compact_psf)]
+    compact_edge_energy = float(compact_case.get("mean_edge_energy", 0.0))
+    compact_psf_truncated = compact_edge_energy > psf_edge_energy_threshold
+    selected_psf = (
+        largest_psf
+        if compact_psf_truncated or psf_gain > psf_threshold_db
+        else compact_psf
+    )
 
     if grid_gain > grid_limited_threshold_db:
         bottleneck = "simulation_grid"
@@ -103,12 +111,15 @@ def select_optical_settings(
         "grid_deltas_to_largest_db": grid_deltas,
         "grid_gain_512_to_largest_db": grid_gain,
         "psf_gain_at_selected_grid_db": psf_gain,
+        "compact_psf_edge_energy": compact_edge_energy,
+        "compact_psf_truncated": compact_psf_truncated,
         "grid_limited": grid_gain > grid_limited_threshold_db,
         "primary_bottleneck": bottleneck,
         "thresholds_db": {
             "grid_converged": convergence_threshold_db,
             "grid_limited": grid_limited_threshold_db,
             "psf_range": psf_threshold_db,
+            "psf_edge_energy": psf_edge_energy_threshold,
         },
     }
 
@@ -120,6 +131,8 @@ def build_strict_finetune_config(
     cache_file: str,
     fixed_psf_cache_file: str,
     initialize_from: str,
+    training_crop_size: int = 128,
+    spatial_field_crop_grid: int | None = None,
 ) -> EDOFConfig:
     """Apply a convergence decision without changing the disclosed paper loss."""
 
@@ -138,7 +151,7 @@ def build_strict_finetune_config(
             finetune_psf_cache_file=fixed_psf_cache_file,
             propagation_batch_size=1,
         ),
-        dataset=replace(base.dataset, crop_size=128),
+        dataset=replace(base.dataset, crop_size=training_crop_size),
         evaluation=replace(
             base.evaluation,
             crop_size=1000,
@@ -156,6 +169,7 @@ def build_strict_finetune_config(
             pixel_loss_type="rmse",
             cross_depth_loss_weight=1.0,
             local_field_patches=True,
+            spatial_field_crop_grid=spatial_field_crop_grid,
             resume=None,
             initialize_from=initialize_from,
         ),
