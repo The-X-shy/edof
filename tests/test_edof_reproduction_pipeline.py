@@ -21,6 +21,11 @@ from edof_reproduction.config import (
     validate_config,
 )
 from edof_reproduction.dataset import DIV2KDataset
+from edof_reproduction.convergence import (
+    crop_normalized_psfs,
+    mean_edge_energy,
+    select_optical_settings,
+)
 from edof_reproduction.imaging import (
     _spatial_convolution_loop,
     interpolate_psf_grid,
@@ -230,6 +235,50 @@ def test_full_field_convolution_rejects_invalid_chunk_size() -> None:
         assert "positive" in str(error)
     else:
         raise AssertionError("invalid field chunk size was accepted")
+
+
+def test_convergence_psf_crop_is_centered_and_normalized() -> None:
+    psfs = torch.zeros(3, 9, 3, 7, 7)
+    psfs[..., 2:5, 2:5] = 1.0
+    cropped = crop_normalized_psfs(psfs, 5)
+    assert cropped.shape == (3, 9, 3, 5, 5)
+    assert torch.allclose(
+        cropped.sum(dim=(-2, -1)),
+        torch.ones(3, 9, 3),
+    )
+    assert mean_edge_energy(cropped, border=1) == 0.0
+
+
+def test_convergence_selection_applies_declared_psnr_gates() -> None:
+    cases = [
+        {"simulation_grid": 512, "psf_size": 63, "mean_raw_psnr": 16.00},
+        {"simulation_grid": 512, "psf_size": 127, "mean_raw_psnr": 16.10},
+        {"simulation_grid": 768, "psf_size": 63, "mean_raw_psnr": 16.30},
+        {"simulation_grid": 768, "psf_size": 127, "mean_raw_psnr": 16.45},
+        {"simulation_grid": 1024, "psf_size": 63, "mean_raw_psnr": 16.50},
+        {"simulation_grid": 1024, "psf_size": 127, "mean_raw_psnr": 16.52},
+    ]
+    decision = select_optical_settings(cases)
+    assert decision["selected_simulation_grid"] == 768
+    assert decision["selected_psf_size"] == 127
+    assert decision["grid_limited"]
+    assert decision["primary_bottleneck"] == "simulation_grid"
+
+
+def test_convergence_selection_keeps_compact_settings_when_converged() -> None:
+    cases = [
+        {"simulation_grid": 512, "psf_size": 63, "mean_raw_psnr": 16.00},
+        {"simulation_grid": 512, "psf_size": 127, "mean_raw_psnr": 16.03},
+        {"simulation_grid": 768, "psf_size": 63, "mean_raw_psnr": 16.02},
+        {"simulation_grid": 768, "psf_size": 127, "mean_raw_psnr": 16.05},
+        {"simulation_grid": 1024, "psf_size": 63, "mean_raw_psnr": 16.04},
+        {"simulation_grid": 1024, "psf_size": 127, "mean_raw_psnr": 16.07},
+    ]
+    decision = select_optical_settings(cases)
+    assert decision["selected_simulation_grid"] == 512
+    assert decision["selected_psf_size"] == 63
+    assert not decision["grid_limited"]
+    assert decision["primary_bottleneck"] == "proxy_lens_parameters"
 
 
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:
