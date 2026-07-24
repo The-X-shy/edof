@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 from torch.nn import functional as F
@@ -80,6 +81,28 @@ def tiny_config(tmp_path: Path, epochs: int = 3) -> EDOFConfig:
         output=OutputConfig(root=str(tmp_path), run_name="test", workspace_id="test"),
         source_config="test-config",
     )
+
+
+def test_json_config_preserves_scientific_notation_as_float(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "scientific.json"
+    path.write_text(
+        json.dumps({"training": {"finetune_lr": 5e-05}}),
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert isinstance(config.training.finetune_lr, float)
+    assert config.training.finetune_lr == 5e-05
+
+
+def test_invalid_text_learning_rate_fails_during_config_loading(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "invalid.yaml"
+    path.write_text("training:\n  finetune_lr: 5e-05\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="training.finetune_lr must be numeric"):
+        load_config(path)
 
 
 def test_mac_config_encodes_three_epoch_smoke() -> None:

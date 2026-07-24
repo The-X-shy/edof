@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -150,7 +151,12 @@ def _section(cls: type, payload: dict[str, Any], name: str):
 
 def load_config(path: str | Path) -> EDOFConfig:
     source = Path(path)
-    payload = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    text = source.read_text(encoding="utf-8-sig")
+    payload = (
+        json.loads(text)
+        if source.suffix.lower() == ".json"
+        else yaml.safe_load(text)
+    ) or {}
     config = EDOFConfig(
         optics=_section(OpticsConfig, payload, "optics"),
         network=_section(NetworkConfig, payload, "network"),
@@ -175,6 +181,12 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("optics.backend must be deeplens or analytic")
     if optics.cache_device not in {"auto", "cpu", "cuda"}:
         raise ValueError("optics.cache_device must be auto, cpu, or cuda")
+    for name in ("doe_lr", "network_lr", "finetune_lr"):
+        value = getattr(training, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"training.{name} must be numeric")
+        if value <= 0.0:
+            raise ValueError(f"training.{name} must be positive")
     if len(optics.depths_mm) != 3:
         raise ValueError("the paper reproduction requires exactly three depths")
     if tuple(len(group) for group in optics.wavelengths_rgb_um) != (3, 3, 3):
