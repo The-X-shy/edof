@@ -140,10 +140,15 @@ def _loss_from_psfs(
     pixel_loss_type: str = "mse",
     cross_depth_loss_weight: float = 0.0,
     depth_loss_weights: tuple[float, ...] | None = None,
+    field_refine_factor: int = 1,
 ) -> tuple[Tensor, dict[str, float], list[Tensor]]:
     reconstructions: list[Tensor] = []
     for depth_index in range(psfs.shape[0]):
-        sensor = _spatial_convolution(clean, psfs[depth_index])
+        sensor = _spatial_convolution(
+            clean,
+            psfs[depth_index],
+            field_refine_factor=field_refine_factor,
+        )
         if noise_std > 0:
             sensor = sensor + torch.randn_like(sensor) * noise_std
         reconstructions.append(network(sensor))
@@ -493,6 +498,7 @@ def run_training(
     fixed_finetune_psfs: Tensor | None = None
     fixed_finetune_psf_path: Path | None = None
     stopped_early = False
+    stop_reason: str | None = None
     epochs_completed = start_epoch
 
     for epoch in range(start_epoch, total_epochs):
@@ -570,6 +576,7 @@ def run_training(
                     pixel_loss_type=config.training.pixel_loss_type,
                     cross_depth_loss_weight=config.training.cross_depth_loss_weight,
                     depth_loss_weights=config.training.depth_loss_weights,
+                    field_refine_factor=config.optics.spatial_psf_refine_factor,
                 )
                 psfs = batch_psfs
             (loss / config.training.accumulation_steps).backward()
@@ -636,6 +643,7 @@ def run_training(
                 field_grid=config.evaluation.field_grid,
                 local_field_patches=config.evaluation.local_field_patches,
                 fixed_psfs=fixed_finetune_psfs if stage == "finetune" else None,
+                field_refine_factor=config.optics.spatial_psf_refine_factor,
             )
             validation_row = {"epoch": epoch + 1, "stage": stage, **validation_result}
             with validation_log_path.open("a", encoding="utf-8") as handle:
@@ -688,12 +696,37 @@ def run_training(
             cache_path=cache_path,
         )
 
+        minimum_psnr_failed = (
+            validation_result is not None
+            and config.evaluation.minimum_psnr_epoch == epoch + 1
+            and validation_result["mean"]["psnr"] < config.evaluation.minimum_psnr
+        )
+        if minimum_psnr_failed:
+            stopped_early = True
+            stop_reason = "minimum_psnr_gate"
+            print(
+                json.dumps(
+                    {
+                        "minimum_psnr_gate": {
+                            "epoch": epoch + 1,
+                            "measured_psnr": validation_result["mean"]["psnr"],
+                            "required_psnr": config.evaluation.minimum_psnr,
+                            "passed": False,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            break
+
         if (
             stage == "finetune"
             and validation_loader is not None
             and evaluations_without_improvement >= config.evaluation.early_stopping_patience
         ):
             stopped_early = True
+            stop_reason = "early_stopping"
             print(
                 json.dumps(
                     {
@@ -732,6 +765,7 @@ def run_training(
             field_grid=config.evaluation.field_grid,
             local_field_patches=config.evaluation.local_field_patches,
             fixed_psfs=fixed_finetune_psfs,
+            field_refine_factor=config.optics.spatial_psf_refine_factor,
         )
         depth_metrics = final_evaluation["depth_metrics"]
         final_psfs = final_sample["psfs"]
@@ -793,6 +827,7 @@ def run_training(
         "joint_epochs": config.training.joint_epochs,
         "finetune_epochs": config.training.finetune_epochs,
         "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
         "best_epoch": best_epoch,
         "best_validation_psnr": best_validation_psnr if best_epoch is not None else None,
         "selected_checkpoint": str(selected_checkpoint),
@@ -991,6 +1026,7 @@ def run_checkpoint_evaluation(
         field_grid=config.evaluation.field_grid,
         local_field_patches=config.evaluation.local_field_patches,
         fixed_psfs=fixed_psfs,
+        field_refine_factor=config.optics.spatial_psf_refine_factor,
     )
 
     clean_path = output / "validation_clean.png"

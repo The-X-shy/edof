@@ -42,6 +42,7 @@ class OpticsConfig:
     cache_complex_dtype: str = "complex128"
     propagation_precision: str = "float32"
     propagation_batch_size: int | None = None
+    spatial_psf_refine_factor: int = 1
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,8 @@ class EvaluationConfig:
     early_stopping_min_delta: float = 0.02
     field_grid: int | None = None
     local_field_patches: bool = False
+    minimum_psnr_epoch: int | None = None
+    minimum_psnr: float | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +201,8 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("propagation_precision must be float32 or float64")
     if optics.propagation_batch_size is not None and optics.propagation_batch_size < 1:
         raise ValueError("propagation_batch_size must be positive when provided")
+    if optics.spatial_psf_refine_factor < 1:
+        raise ValueError("spatial_psf_refine_factor must be positive")
     if optics.coherent_rays < 1_000_000 and optics.backend == "deeplens":
         raise ValueError("DeepLens coherent ray tracing requires at least 1,000,000 rays")
     if training.joint_epochs < 0 or training.finetune_epochs < 0:
@@ -250,6 +255,11 @@ def validate_config(config: EDOFConfig) -> None:
             raise ValueError(
                 "training crop and PSF subgrid must preserve the full-sensor field-cell size"
             )
+        refined_training_grid = patch_grid * optics.spatial_psf_refine_factor
+        if dataset.crop_size % refined_training_grid:
+            raise ValueError(
+                "dataset crop_size must be divisible by the refined training field grid"
+            )
     if training.psf_pretrain_size_weight < 0.0 or training.psf_pretrain_similarity_weight < 0.0:
         raise ValueError("PSF pretraining weights must be non-negative")
     if training.psf_pretrain_steps > 0 and (
@@ -264,5 +274,26 @@ def validate_config(config: EDOFConfig) -> None:
         raise ValueError("evaluation interval and early-stopping patience must be positive")
     if evaluation.field_grid is not None and evaluation.field_grid < optics.field_grid:
         raise ValueError("evaluation.field_grid must be at least optics.field_grid")
+    if (
+        evaluation.enabled
+        and evaluation.field_grid is not None
+        and optics.spatial_psf_refine_factor > 1
+        and evaluation.crop_size
+        % (evaluation.field_grid * optics.spatial_psf_refine_factor)
+    ):
+        raise ValueError(
+            "evaluation crop_size must be divisible by the refined evaluation field grid"
+        )
     if evaluation.early_stopping_min_delta < 0.0 or evaluation.noise_std < 0.0:
         raise ValueError("evaluation deltas and noise must be non-negative")
+    gate_values = (evaluation.minimum_psnr_epoch, evaluation.minimum_psnr)
+    if (gate_values[0] is None) != (gate_values[1] is None):
+        raise ValueError("minimum PSNR gate requires both epoch and threshold")
+    if evaluation.minimum_psnr_epoch is not None:
+        if evaluation.minimum_psnr_epoch < 1 or evaluation.minimum_psnr <= 0.0:
+            raise ValueError("minimum PSNR gate values must be positive")
+        total_epochs = training.joint_epochs + training.finetune_epochs
+        if evaluation.minimum_psnr_epoch > total_epochs:
+            raise ValueError("minimum PSNR gate epoch exceeds the training schedule")
+        if evaluation.minimum_psnr_epoch % evaluation.every_n_epochs:
+            raise ValueError("minimum PSNR gate epoch must be a validation epoch")

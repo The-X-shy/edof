@@ -361,6 +361,7 @@ def test_strict_background_workers_expose_project_to_python() -> None:
         "windows_strict_optics_worker.ps1",
         "windows_strict_finetune_worker.ps1",
         "windows_strict_spatial_finetune_worker.ps1",
+        "windows_ordered_optimization_worker.ps1",
     ):
         source = Path("scripts", name).read_text(encoding="utf-8")
         assert "$env:PYTHONPATH = $ProjectRoot" in source
@@ -374,6 +375,14 @@ def test_contiguous_psf_subgrid_is_row_major_and_cycles() -> None:
     assert first[0, :, 0, 0, 0].tolist() == [0.0, 1.0, 4.0, 5.0]
     assert middle[0, :, 0, 0, 0].tolist() == [5.0, 6.0, 9.0, 10.0]
     assert torch.equal(first, wrapped)
+
+
+def test_ordered_optimization_start_does_not_auto_retry_failures() -> None:
+    source = Path(
+        "scripts", "windows_ordered_optimization_start.ps1"
+    ).read_text(encoding="utf-8")
+    assert "RestartCount" not in source
+    assert "EDOFOrderedOptimization" in source
 
 
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:
@@ -474,6 +483,20 @@ def test_spatial_convolution_matches_full_image_reference() -> None:
             groups=3,
         )
     assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_refined_spatial_convolution_matches_constant_psf_and_backpropagates() -> None:
+    torch.manual_seed(14)
+    image = torch.rand(1, 3, 16, 16)
+    kernel = torch.rand(3, 3, 3)
+    kernel = kernel / kernel.sum(dim=(-2, -1), keepdim=True)
+    psfs = kernel.unsqueeze(0).repeat(4, 1, 1, 1).requires_grad_(True)
+    refined = spatial_convolution(image, psfs, field_refine_factor=2)
+    expected = spatial_convolution(image, psfs[:1])
+    assert torch.allclose(refined, expected, atol=1e-6)
+    refined.mean().backward()
+    assert psfs.grad is not None
+    assert torch.isfinite(psfs.grad).all()
 
 
 def test_psf_map_interpolation_is_normalized() -> None:
@@ -612,6 +635,30 @@ def test_validation_averages_all_samples_and_saves_best_checkpoint(tmp_path: Pat
     assert all(item["samples"] == 1 for item in result["final_depth_metrics"])
     assert (output / "checkpoints" / "best.pt").exists()
     assert len((output / "validation_log.jsonl").read_text().strip().splitlines()) == 2
+    assert "spatial" in result["validation_mean"]
+
+
+def test_minimum_psnr_gate_stops_a_failed_short_run(tmp_path: Path) -> None:
+    config = replace(
+        tiny_config(tmp_path, epochs=3),
+        evaluation=EvaluationConfig(
+            enabled=True,
+            crop_size=16,
+            batch_size=1,
+            workers=0,
+            every_n_epochs=1,
+            use_lpips=False,
+            noise_std=0.0,
+            early_stopping_patience=3,
+            early_stopping_min_delta=0.0,
+            minimum_psnr_epoch=1,
+            minimum_psnr=200.0,
+        ),
+    )
+    result = run_training(config, output_override=tmp_path / "gated")
+    assert result["epochs_completed"] == 1
+    assert result["stopped_early"]
+    assert result["stop_reason"] == "minimum_psnr_gate"
 
 
 def test_local_field_fixed_optics_finetune_runs(tmp_path: Path) -> None:
