@@ -84,15 +84,34 @@ def run_step(
     return summary
 
 
+def _resume_after_corrected_smooth_gate(
+    previous: dict[str, Any],
+    smooth_summary_path: Path,
+) -> bool:
+    if previous.get("status") != "stopped_at_smooth_psf_gate":
+        return False
+    if not smooth_summary_path.exists():
+        return False
+    return bool(read_json(smooth_summary_path).get("passed"))
+
+
 def run(project_root: Path) -> dict[str, Any]:
     project_root = project_root.resolve()
     workspace = project_root / "workspace" / "edof_reproduction"
     output = workspace / "windows_ordered_optimization"
     state_path = output / "state.json"
     summary_path = output / "summary.json"
+    smooth_summary_path = (
+        workspace / "windows_smooth_psf_gate" / "summary.json"
+    )
     output.mkdir(parents=True, exist_ok=True)
     if summary_path.exists():
-        return read_json(summary_path)
+        previous = read_json(summary_path)
+        if not _resume_after_corrected_smooth_gate(
+            previous,
+            smooth_summary_path,
+        ):
+            return previous
     state = {
         "status": "running",
         "started_at": now(),
@@ -116,7 +135,7 @@ def run(project_root: Path) -> dict[str, Any]:
         state_path,
         "02_smooth_psf_gate",
         "run_smooth_psf_gate.py",
-        workspace / "windows_smooth_psf_gate" / "summary.json",
+        smooth_summary_path,
     )
     if not smooth.get("passed"):
         summary = {

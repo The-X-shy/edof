@@ -57,7 +57,7 @@ def save_image(tensor: torch.Tensor, path: Path) -> None:
     Image.fromarray(array).save(path)
 
 
-def run(project_root: Path) -> dict[str, Any]:
+def run(project_root: Path, *, force: bool = False) -> dict[str, Any]:
     project_root = project_root.resolve()
     workspace = project_root / "workspace" / "edof_reproduction"
     strict_output = workspace / "windows_strict_spatial_finetune"
@@ -65,7 +65,7 @@ def run(project_root: Path) -> dict[str, Any]:
     state_path = output / "state.json"
     summary_path = output / "summary.json"
     output.mkdir(parents=True, exist_ok=True)
-    if summary_path.exists():
+    if summary_path.exists() and not force:
         return read_json(summary_path)
 
     fixed_psf_cache = strict_output / "fixed_psf_map_40x40_1024_k127.pt"
@@ -151,12 +151,8 @@ def run(project_root: Path) -> dict[str, Any]:
 
     hard_mean = evaluations["hard"]["mean"]
     smooth_mean = evaluations["smooth"]["mean"]
-    hard_seam = float(
-        hard_mean["spatial"]["raw_boundary_discontinuity"]
-    )
-    smooth_seam = float(
-        smooth_mean["spatial"]["raw_boundary_discontinuity"]
-    )
+    hard_seam = float(hard_mean["spatial"]["raw_boundary_excess"])
+    smooth_seam = float(smooth_mean["spatial"]["raw_boundary_excess"])
     seam_reduction = 1.0 - smooth_seam / max(hard_seam, 1e-12)
     raw_psnr_drop = float(hard_mean["raw"]["psnr"]) - float(
         smooth_mean["raw"]["psnr"]
@@ -173,6 +169,8 @@ def run(project_root: Path) -> dict[str, Any]:
             "psf_size": 127,
             "base_field_grid": 40,
             "refine_factor": REFINE_FACTOR,
+            "seam_metric": "raw_boundary_excess",
+            "seam_neighborhood_pixels": 3,
             "validation_images": 100,
             "noise_seed": config.training.seed,
         },
@@ -184,6 +182,12 @@ def run(project_root: Path) -> dict[str, Any]:
             "hard_seam": hard_seam,
             "smooth_seam": smooth_seam,
             "seam_reduction": seam_reduction,
+            "hard_absolute_boundary": hard_mean["spatial"][
+                "raw_boundary_discontinuity"
+            ],
+            "smooth_absolute_boundary": smooth_mean["spatial"][
+                "raw_boundary_discontinuity"
+            ],
             "hard_raw_psnr": hard_mean["raw"]["psnr"],
             "smooth_raw_psnr": smooth_mean["raw"]["psnr"],
             "raw_psnr_drop_db": raw_psnr_drop,
@@ -209,8 +213,13 @@ def run(project_root: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="recompute the gate even when a previous summary exists",
+    )
     args = parser.parse_args()
-    run(args.project_root)
+    run(args.project_root, force=args.force)
     return 0
 
 

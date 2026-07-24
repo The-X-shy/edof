@@ -21,6 +21,7 @@ from edof_reproduction.config import (
     validate_config,
 )
 from edof_reproduction.dataset import DIV2KDataset
+from edof_reproduction.evaluation import _boundary_excess_discontinuity
 from edof_reproduction.convergence import (
     build_strict_finetune_config,
     crop_normalized_psfs,
@@ -383,6 +384,49 @@ def test_ordered_optimization_start_does_not_auto_retry_failures() -> None:
     ).read_text(encoding="utf-8")
     assert "RestartCount" not in source
     assert "EDOFOrderedOptimization" in source
+
+
+def test_boundary_excess_ignores_scene_edges_and_detects_psf_seams() -> None:
+    target = torch.zeros(1, 1, 16, 16)
+    target[..., 8:] = 1.0
+    natural_edge = _boundary_excess_discontinuity(target, target, field_side=2)
+    hard_seam = target.clone()
+    hard_seam[..., 8:] += 0.2
+    hard_excess = _boundary_excess_discontinuity(
+        hard_seam,
+        target,
+        field_side=2,
+    )
+    smooth_offset = torch.linspace(0.0, 0.2, 16).reshape(1, 1, 1, 16)
+    smooth = target + smooth_offset
+    smooth_excess = _boundary_excess_discontinuity(
+        smooth,
+        target,
+        field_side=2,
+    )
+    assert torch.equal(natural_edge, torch.zeros_like(natural_edge))
+    assert hard_excess.item() > 0.09
+    assert smooth_excess.item() < 1e-6
+
+
+def test_ordered_sequence_can_resume_only_after_corrected_gate_passes(
+    tmp_path: Path,
+) -> None:
+    from scripts.run_ordered_optimization_sequence import (
+        _resume_after_corrected_smooth_gate,
+    )
+
+    smooth_summary = tmp_path / "smooth.json"
+    previous = {"status": "stopped_at_smooth_psf_gate"}
+    assert not _resume_after_corrected_smooth_gate(previous, smooth_summary)
+    smooth_summary.write_text('{"passed": false}', encoding="utf-8")
+    assert not _resume_after_corrected_smooth_gate(previous, smooth_summary)
+    smooth_summary.write_text('{"passed": true}', encoding="utf-8")
+    assert _resume_after_corrected_smooth_gate(previous, smooth_summary)
+    assert not _resume_after_corrected_smooth_gate(
+        {"status": "completed"},
+        smooth_summary,
+    )
 
 
 def test_deeplens_25_disables_automatic_4000_grid_upsampling() -> None:

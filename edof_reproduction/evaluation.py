@@ -66,6 +66,100 @@ def _boundary_discontinuity(image: Tensor, field_side: int) -> Tensor:
     return (vertical + horizontal) * 0.5
 
 
+def _boundary_excess_discontinuity(
+    image: Tensor,
+    target: Tensor,
+    field_side: int,
+    *,
+    neighborhood: int = 3,
+) -> Tensor:
+    """Measure seam-only error after removing scene edges and local gradients.
+
+    The absolute gradient at a field boundary includes real edges in the clean
+    image.  Measuring the residual ``image - target`` removes that content.
+    Subtracting nearby residual gradients then isolates the extra discontinuity
+    concentrated exactly on the PSF-cell boundary.
+    """
+
+    if image.shape != target.shape:
+        raise ValueError("image and target shapes must match")
+    if field_side <= 1:
+        return image.new_zeros(image.shape[0])
+    if neighborhood < 1:
+        raise ValueError("neighborhood must be positive")
+
+    residual = image - target
+    height, width = residual.shape[-2:]
+
+    def axis_excess(length: int, axis: int) -> Tensor:
+        positions = sorted(
+            {(index * length) // field_side for index in range(1, field_side)}
+        )
+        positions = [position for position in positions if 0 < position < length]
+        if not positions:
+            return image.new_zeros(image.shape[0])
+        boundary_positions = set(positions)
+        if axis == -1:
+            gradients = (
+                residual[..., 1:] - residual[..., :-1]
+            ).abs().mean(dim=(1, 2))
+        else:
+            gradients = (
+                residual[..., 1:, :] - residual[..., :-1, :]
+            ).abs().mean(dim=(1, 3))
+        nearby_indices = []
+        for position in positions:
+            nearby = []
+            for offset in range(-neighborhood, neighborhood + 1):
+                candidate = position + offset
+                if (
+                    offset == 0
+                    or candidate <= 0
+                    or candidate >= length
+                    or candidate in boundary_positions
+                ):
+                    continue
+                nearby.append(candidate - 1)
+            nearby_indices.append(nearby)
+        max_nearby = max((len(indices) for indices in nearby_indices), default=0)
+        boundary_index = torch.tensor(
+            [position - 1 for position in positions],
+            device=image.device,
+            dtype=torch.long,
+        )
+        boundary_gradient = gradients[:, boundary_index]
+        if max_nearby == 0:
+            return boundary_gradient.clamp_min(0.0).mean(dim=1)
+        index_matrix = torch.zeros(
+            len(positions),
+            max_nearby,
+            device=image.device,
+            dtype=torch.long,
+        )
+        valid = torch.zeros(
+            len(positions),
+            max_nearby,
+            device=image.device,
+            dtype=image.dtype,
+        )
+        for row, indices in enumerate(nearby_indices):
+            if indices:
+                index_matrix[row, : len(indices)] = torch.tensor(
+                    indices,
+                    device=image.device,
+                    dtype=torch.long,
+                )
+                valid[row, : len(indices)] = 1.0
+        local_baseline = (
+            gradients[:, index_matrix] * valid[None]
+        ).sum(dim=2) / valid.sum(dim=1).clamp_min(1.0)[None]
+        return (boundary_gradient - local_baseline).clamp_min(0.0).mean(dim=1)
+
+    vertical = axis_excess(width, -1)
+    horizontal = axis_excess(height, -2)
+    return (vertical + horizontal) * 0.5
+
+
 @torch.no_grad()
 def evaluate_reconstruction(
     optics: CachedRayWaveOptics,
@@ -112,6 +206,8 @@ def evaluate_reconstruction(
             raw_edge_psnr=0.0,
             boundary_discontinuity=0.0,
             raw_boundary_discontinuity=0.0,
+            boundary_excess=0.0,
+            raw_boundary_excess=0.0,
             samples=0,
         )
         for _ in depths_mm
@@ -152,6 +248,16 @@ def evaluate_reconstruction(
             field_side = round(depth_psfs.shape[0] ** 0.5)
             boundary = _boundary_discontinuity(reconstruction, field_side)
             raw_boundary = _boundary_discontinuity(sensor_clamped, field_side)
+            boundary_excess = _boundary_excess_discontinuity(
+                reconstruction,
+                clean,
+                field_side,
+            )
+            raw_boundary_excess = _boundary_excess_discontinuity(
+                sensor_clamped,
+                clean,
+                field_side,
+            )
             count = clean.shape[0]
             totals[depth_index]["psnr"] += float(psnr.sum())
             totals[depth_index]["ssim"] += float(ssim.sum())
@@ -170,6 +276,12 @@ def evaluate_reconstruction(
             totals[depth_index]["boundary_discontinuity"] += float(boundary.sum())
             totals[depth_index]["raw_boundary_discontinuity"] += float(
                 raw_boundary.sum()
+            )
+            totals[depth_index]["boundary_excess"] += float(
+                boundary_excess.sum()
+            )
+            totals[depth_index]["raw_boundary_excess"] += float(
+                raw_boundary_excess.sum()
             )
             totals[depth_index]["samples"] += count
             if batch_index == 0 and depth_index == 1:
@@ -215,6 +327,10 @@ def evaluate_reconstruction(
                     "raw_boundary_discontinuity": (
                         total["raw_boundary_discontinuity"] / count
                     ),
+                    "boundary_excess": total["boundary_excess"] / count,
+                    "raw_boundary_excess": (
+                        total["raw_boundary_excess"] / count
+                    ),
                 },
             }
         )
@@ -252,6 +368,8 @@ def evaluate_reconstruction(
             "raw_middle_psnr",
             "raw_edge_psnr",
             "raw_boundary_discontinuity",
+            "boundary_excess",
+            "raw_boundary_excess",
         )
     }
     return {"depth_metrics": depth_metrics, "mean": mean_metrics}, sample
